@@ -1,0 +1,16 @@
+---
+- name: Refresh CachyOS mirrors on Kubernetes nodes
+  hosts: kubernetes
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Refresh mirrors with cachyos-rate-mirrors
+      shell: cachyos-rate-mirrors
+      register: mirror_result
+      changed_when: true
+
+    - name: Show mirror refresh output
+      debug:
+        msg: "{{ mirror_result.stdout_lines }}"
+      when: mirror_result.stdout != ""

@@ -1,0 +1,22 @@
+---
+collections:
+  # Core utilities - essential for most playbooks
+  - name: community.general
+  - name: ansible.posix
+  
+  # Kubernetes management
+  - name: kubernetes.core
+  
+  # Container/Docker
+  - name: community.docker
+  - name: containers.podman
+  
+  # Linux system management
+  - name: ansible.utils
+  
+  # Cloud (you mentioned OCI/AWS experience)
+  - name: amazon.aws
+  - name: community.aws
+  
+  # Security/crypto (useful for certs, vault, etc)
+  - name: community.crypto

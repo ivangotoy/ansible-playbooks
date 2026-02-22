@@ -1,0 +1,49 @@
+---
+- name: Update Jenkins plugins
+  hosts: alder
+  become: true
+  vars:
+    jenkins_url: "http://alder:8090"
+    jenkins_username: "ivangotoy"
+    jenkins_api_token: "118548c235598a9d22caf7cfa30940043f"
+    jenkins_auth:
+      user: "{{ jenkins_username }}"
+      password: "{{ jenkins_api_token }}"
+      force_basic_auth: true
+    jenkins_opts:
+      validate_certs: false
+  tasks:
+    - name: Fetch Jenkins plugin list with updates
+      ansible.builtin.uri:
+        url: "{{ jenkins_url }}/pluginManager/api/json?depth=1"
+        method: GET
+        user: "{{ jenkins_auth.user }}"
+        password: "{{ jenkins_auth.password }}"
+        force_basic_auth: "{{ jenkins_auth.force_basic_auth }}"
+        return_content: true
+        validate_certs: "{{ jenkins_opts.validate_certs }}"
+      register: plugins_response
+
+    - name: Set outdated plugins
+      set_fact:
+        outdated_plugins: "{{ plugins_response.json.plugins | selectattr('hasUpdate', 'equalto', true) | map(attribute='shortName') | list }}"
+
+    - name: Update outdated plugins in parallel
+      community.general.jenkins_plugin:
+        url: "{{ jenkins_url }}"
+        url_username: "{{ jenkins_auth.user }}"
+        url_password: "{{ jenkins_auth.password }}"
+        name: "{{ item }}"
+        state: latest
+        validate_certs: "{{ jenkins_opts.validate_certs }}"
+      loop: "{{ outdated_plugins }}"
+      when: outdated_plugins | length > 0
+
+      #- name: Restart Jenkins if plugins were updated
+      #community.general.jenkins_script:
+      #  url: "{{ jenkins_url }}"
+      #  user: "{{ jenkins_auth.user }}"
+      #  password: "{{ jenkins_auth.password }}"
+      #  script: "Jenkins.instance.restart()"
+      #when: outdated_plugins | length > 0
+
