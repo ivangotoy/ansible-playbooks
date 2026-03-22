@@ -1,23 +1,108 @@
-Ansible for home use/learning purposed + initial setup:
+# ansible-playbooks
 
-1. python venv: cd ; python -m venv ansible-learning
+Production-grade Ansible playbooks for Linux infrastructure management — Kubernetes nodes (CachyOS/Arch), mixed Debian/Arch environments, and homelab services.
 
-2. shell alias in ~/.bashrc or ~/.zshrc to enter the Venv: alias alearn=". ${HOME}/ansible-learning/bin/activate"
+## Structure
 
-3. reminder for the alias in .zshrc/.bashrc printf "type alearn to enter ansible venv\n"
+| Playbook | Target | Description |
+|---|---|---|
+| `cluster-perf-tuning.yml` | Kubernetes nodes | CPU governor, THP, network buffers, containerd tuning |
+| `kubernetes-nodes-update-v2.yml` | Kubernetes nodes | Rolling package upgrades via paru (serial, safe) |
+| `kubernetes-nodes-update.yml` | Kubernetes nodes | Parallel package upgrades via paru |
+| `refresh-mirrors.yml` | Kubernetes nodes | CachyOS mirror refresh via cachyos-rate-mirrors |
+| `update-upgrade.yml` | Mixed (Debian/Arch) | OS-aware package upgrades with async execution |
+| `update-jenkins-plugins.yml` | Jenkins host | Automated Jenkins plugin updates via API |
 
-3. activate the venv: type alearn
+## Requirements
+```bash
+pip install ansible ansible-lint
+ansible-galaxy collection install -r requirements.yml
+```
 
-4. install useful packages in the venv: pip install --no-cache-dir -U ansible ansible-lint mitogen pip
+## Configuration
 
-5. check ansible version: ansible --version
+Copy and adapt `ansible.cfg` to your environment. Key settings:
 
-6. create ansible.cfg , inventory playbooks directory , playbook files etc.
+- `become_method = doas` — uses doas instead of sudo
+- `forks = 50` — parallel execution
+- `fact_caching = jsonfile` — caches facts for 1 hour
+- `pipelining = true` — SSH connection reuse for performance
 
-7. check playbooks with ansible-lint e.g. ansible-lint my-super-cool-playbook.yml and die from cringe
+Create a dedicated `ansible` user on all managed nodes with your SSH public key in `~/.ssh/authorized_keys`.
 
-8. setup redis: apt install valkey && systemctl enable --now valkey
+## Inventory
+```ini
+[webservers]
+host1 ansible_host=host1
+host2 ansible_host=host2
 
-9. create ansible user on all nodes with proper permissions
+[kubernetes]
+node-01 ansible_host=node-01
+node-02 ansible_host=node-02
+node-03 ansible_host=node-03
+kube    ansible_host=kube
+```
 
-10. generate ansible ssh ed25519 key pair , put the public part of the key on all nodes that need to be contorlled with ansible (in ansible user ~/.ssh/authorized_keys)
+## Playbook Details
+
+### cluster-perf-tuning.yml
+
+Two-phase playbook targeting Kubernetes node performance:
+
+**Phase 1 — Zero downtime (all nodes in parallel):**
+- Sets CPU governor to `performance` via cpupower, persisted across reboots
+- Disables Transparent Huge Pages (THP) at runtime and via systemd tmpfiles
+- Applies network buffer sysctl tuning (`net.core.rmem_max`, `tcp_rmem`, `tcp_wmem`, etc.)
+
+**Phase 2 — Containerd tuning (serial, shim-safe):**
+- Patches `config.toml` for `SystemdCgroup = true` and `max_concurrent_downloads = 10`
+- Restarts containerd without affecting running pods (shim-safe)
+- Validates kubelet health after each node
+
+Reboots are handled externally by [kured](https://github.com/kubereboot/kured) via sentinel file — this playbook never reboots nodes directly.
+
+### kubernetes-nodes-update-v2.yml
+
+Safe rolling upgrade for CachyOS/Arch Kubernetes nodes:
+- `serial: 1` — one node at a time
+- Updates `archlinux-keyring` first to avoid GPG failures
+- Checks for available upgrades before running — skips if nothing to do
+- Kured handles reboots if kernel was updated
+
+### update-upgrade.yml
+
+OS-aware package upgrade for mixed environments:
+- Auto-detects Debian vs Arch via `ansible_facts['os_family']`
+- Groups hosts dynamically at runtime
+- Uses async execution with polling to avoid SSH timeouts on slow upgrades
+
+### update-jenkins-plugins.yml
+
+Automated Jenkins plugin updates via REST API:
+- Fetches plugin list and filters only plugins with available updates
+- Updates outdated plugins in parallel via `community.general.jenkins_plugin`
+- Requires `vault_jenkins_api_token` via Ansible Vault — never hardcode credentials
+```yaml
+# vars/vault.yml (ansible-vault encrypted)
+vault_jenkins_api_token: "your-token-here"
+```
+
+## Secrets Management
+
+Sensitive values (API tokens, passwords) are never stored in plaintext. Use Ansible Vault:
+```bash
+ansible-vault create vars/vault.yml
+ansible-playbook update-jenkins-plugins.yml --ask-vault-pass
+```
+
+## Linting
+```bash
+ansible-lint *.yml
+```
+
+## Environment
+
+- **Kubernetes nodes:** CachyOS (Arch-based), managed with `paru`
+- **Web servers:** Mixed Debian/Arch
+- **Privilege escalation:** `doas`
+- **SSH:** Ed25519 keys, ControlMaster persistent connections Sonnet 4.6

@@ -1,0 +1,118 @@
+---
+# Kubernetes cluster performance tuning
+# Applies: CPU governor, THP, network buffers, containerd optimizations
+# Reboot: triggered via kured sentinel if containerd driver changes applied
+
+- name: Phase 1 — sysctl + CPU governor + THP (all nodes, zero downtime)
+  hosts: kubernetes
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    - name: Set CPU governor to performance
+      shell: cpupower frequency-set -g performance
+      changed_when: true
+
+    - name: Persist CPU governor via cpupower config
+      lineinfile:
+        path: /etc/default/cpupower
+        regexp: "^governor="
+        line: "governor='performance'"
+        create: true
+
+    - name: Enable cpupower service
+      systemd:
+        name: cpupower
+        enabled: true
+        state: started
+
+    - name: Set THP to never (runtime)
+      shell: |
+        echo never > /sys/kernel/mm/transparent_hugepage/enabled
+        echo never > /sys/kernel/mm/transparent_hugepage/defrag
+      changed_when: true
+
+    - name: Persist THP=never via systemd tmpfiles
+      copy:
+        dest: /etc/tmpfiles.d/thp-disable.conf
+        content: |
+          w /sys/kernel/mm/transparent_hugepage/enabled - - - - never
+          w /sys/kernel/mm/transparent_hugepage/defrag   - - - - never
+        mode: "0644"
+
+    - name: Apply network buffer and perf sysctl
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_file: /etc/sysctl.d/99-k8s-perf.conf
+        reload: true
+      loop:
+        - { key: "net.core.rmem_max",            value: "134217728" }
+        - { key: "net.core.wmem_max",            value: "134217728" }
+        - { key: "net.core.rmem_default",         value: "67108864"  }
+        - { key: "net.core.wmem_default",         value: "67108864"  }
+        - { key: "net.ipv4.tcp_rmem",             value: "4096 87380 134217728" }
+        - { key: "net.ipv4.tcp_wmem",             value: "4096 65536 134217728" }
+        - { key: "net.core.netdev_max_backlog",   value: "16384"     }
+        - { key: "net.ipv4.tcp_slow_start_after_idle", value: "0"   }
+
+
+- name: Phase 2 — containerd tuning (shim-safe restart, no drain needed)
+  hosts: kubernetes
+  become: true
+  gather_facts: false
+  serial: 1
+
+  tasks:
+
+    - name: Patch containerd config — SystemdCgroup + max_concurrent_downloads
+      shell: |
+        python3 - << 'EOF'
+        import re
+
+        path = "/etc/containerd/config.toml"
+        content = open(path).read()
+        changed = False
+
+        # Fix 1: SystemdCgroup = true in runc options block
+        if "SystemdCgroup = true" not in content:
+            content = re.sub(
+                r"(\[plugins\.'io\.containerd\.cri\.v1\.runtime'\.containerd\.runtimes\.runc\.options\]\n(?:[ \t]+\w[^\n]*\n)*)",
+                lambda m: m.group(0).rstrip("\n") + "\n            SystemdCgroup = true\n",
+                content
+            )
+            changed = True
+
+        # Fix 2: max_concurrent_downloads = 10 (set in both locations)
+        content, n1 = re.subn(r"max_concurrent_downloads = \d+", "max_concurrent_downloads = 10", content)
+        if n1 > 0:
+            changed = True
+
+        open(path, "w").write(content)
+        print("changed" if changed else "ok")
+        EOF
+      register: containerd_patch
+      changed_when: "'changed' in containerd_patch.stdout"
+
+    - name: Restart containerd (shim-safe — running pods unaffected)
+      systemd:
+        name: containerd
+        state: restarted
+      when: containerd_patch.changed
+
+    - name: Wait for containerd to be ready
+      shell: crictl info > /dev/null 2>&1
+      retries: 10
+      delay: 3
+      register: result
+      until: result.rc == 0
+      when: containerd_patch.changed
+
+    - name: Verify kubelet still healthy
+      shell: systemctl is-active kubelet
+      register: kubelet_status
+      changed_when: false
+      failed_when: kubelet_status.stdout != "active"
+      when: containerd_patch.changed

@@ -5,7 +5,7 @@
   vars:
     jenkins_url: "http://alder:8090"
     jenkins_username: "ivangotoy"
-    jenkins_api_token: "118548c235598a9d22caf7cfa30940043f"
+    jenkins_api_token: "{{ vault_jenkins_api_token }}"
     jenkins_auth:
       user: "{{ jenkins_username }}"
       password: "{{ jenkins_api_token }}"
