@@ -1,33 +1,90 @@
 ---
-- name: Upgrade Kubernetes nodes (kured handles reboots)
+- name: Upgrade Kubernetes nodes without rebooting
   hosts: kubernetes
   become: true
   gather_facts: false
   serial: 1
-  
-  tasks:
-    - name: Update archlinux-keyring first
-      become_user: ansible
-      shell: paru -S --noconfirm archlinux-keyring
-      changed_when: false
-      failed_when: false
 
-    - name: Check for available upgrades
-      become_user: ansible
-      shell: paru -Sy --noconfirm && paru -Qu
+  vars:
+    aur_user: ansible
+
+  tasks:
+    - name: Check pacman database lock
+      ansible.builtin.stat:
+        path: /var/lib/pacman/db.lck
+      register: pacman_lock
+
+    - name: Stop if pacman database is locked
+      ansible.builtin.fail:
+        msg: "pacman database is locked on {{ inventory_hostname }}: /var/lib/pacman/db.lck exists"
+      when: pacman_lock.stat.exists
+
+    - name: Update Arch and CachyOS keyrings first
+      ansible.builtin.command:
+        argv:
+          - paru
+          - -S
+          - --needed
+          - --noconfirm
+          - archlinux-keyring
+          - cachyos-keyring
+      become_user: "{{ aur_user }}"
+      environment:
+        LANG: C
+        LC_ALL: C
+      register: keyring_update
+      changed_when: "'there is nothing to do' not in (keyring_update.stdout + keyring_update.stderr | lower)"
+
+    - name: Check available upgrades
+      ansible.builtin.command:
+        argv:
+          - paru
+          - -Qu
+      become_user: "{{ aur_user }}"
       register: paru_upgrades
       changed_when: false
-      failed_when: false
+      failed_when: paru_upgrades.rc not in [0, 1]
 
     - name: Show packages to be upgraded
-      debug:
+      ansible.builtin.debug:
         msg: "{{ paru_upgrades.stdout_lines }}"
       when: paru_upgrades.stdout != ""
 
     - name: Upgrade all packages
-      become_user: ansible
-      shell: paru -Syu --noconfirm
+      ansible.builtin.command:
+        argv:
+          - paru
+          - -Syu
+          - --noconfirm
+      become_user: "{{ aur_user }}"
       environment:
         LANG: C
         LC_ALL: C
+      register: paru_upgrade
+      changed_when: "'there is nothing to do' not in (paru_upgrade.stdout + paru_upgrade.stderr | lower)"
       when: paru_upgrades.stdout != ""
+
+    - name: Verify kubelet is active
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - kubelet
+      changed_when: false
+
+    - name: Verify containerd is active
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - containerd
+      changed_when: false
+
+    - name: Check reboot sentinel for kured
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Show reboot sentinel state
+      ansible.builtin.debug:
+        msg: "reboot sentinel present on {{ inventory_hostname }}: {{ reboot_required.stat.exists }}"
