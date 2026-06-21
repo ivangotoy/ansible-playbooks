@@ -35,6 +35,14 @@
       register: keyring_update
       changed_when: "'there is nothing to do' not in (keyring_update.stdout + keyring_update.stderr | lower)"
 
+    - name: Synchronize pacman databases
+      ansible.builtin.command:
+        argv:
+          - paru
+          - -Sy
+      become_user: "{{ aur_user }}"
+      changed_when: false
+
     - name: Check available upgrades
       ansible.builtin.command:
         argv:
@@ -88,3 +96,4 @@
     - name: Show reboot sentinel state
       ansible.builtin.debug:
         msg: "reboot sentinel present on {{ inventory_hostname }}: {{ reboot_required.stat.exists }}"
+
