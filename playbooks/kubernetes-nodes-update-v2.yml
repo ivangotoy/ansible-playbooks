@@ -28,6 +28,7 @@
           - --noconfirm
           - archlinux-keyring
           - cachyos-keyring
+      become: true
       become_user: "{{ aur_user }}"
       environment:
         LANG: C
@@ -40,6 +41,7 @@
         argv:
           - paru
           - -Sy
+      become: true
       become_user: "{{ aur_user }}"
       changed_when: false
 
@@ -48,6 +50,7 @@
         argv:
           - paru
           - -Qu
+      become: true
       become_user: "{{ aur_user }}"
       register: paru_upgrades
       changed_when: false
@@ -64,6 +67,7 @@
           - paru
           - -Syu
           - --noconfirm
+      become: true
       become_user: "{{ aur_user }}"
       environment:
         LANG: C
@@ -96,4 +100,3 @@
     - name: Show reboot sentinel state
       ansible.builtin.debug:
         msg: "reboot sentinel present on {{ inventory_hostname }}: {{ reboot_required.stat.exists }}"
-

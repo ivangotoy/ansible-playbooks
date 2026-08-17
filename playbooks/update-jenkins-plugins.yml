@@ -25,7 +25,7 @@
       register: plugins_response
 
     - name: Set outdated plugins
-      set_fact:
+      ansible.builtin.set_fact:
         outdated_plugins: "{{ plugins_response.json.plugins | selectattr('hasUpdate', 'equalto', true) | map(attribute='shortName') | list }}"
 
     - name: Update outdated plugins in parallel
@@ -38,12 +38,3 @@
         validate_certs: "{{ jenkins_opts.validate_certs }}"
       loop: "{{ outdated_plugins }}"
       when: outdated_plugins | length > 0
-
-      #- name: Restart Jenkins if plugins were updated
-      #community.general.jenkins_script:
-      #  url: "{{ jenkins_url }}"
-      #  user: "{{ jenkins_auth.user }}"
-      #  password: "{{ jenkins_auth.password }}"
-      #  script: "Jenkins.instance.restart()"
-      #when: outdated_plugins | length > 0
-

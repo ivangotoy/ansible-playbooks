@@ -6,11 +6,13 @@
 
   tasks:
     - name: Refresh mirrors with cachyos-rate-mirrors
-      shell: cachyos-rate-mirrors
+      ansible.builtin.command:
+        argv:
+          - cachyos-rate-mirrors
       register: mirror_result
       changed_when: true
 
     - name: Show mirror refresh output
-      debug:
+      ansible.builtin.debug:
         msg: "{{ mirror_result.stdout_lines }}"
       when: mirror_result.stdout != ""
