@@ -1,7 +1,7 @@
 ---
 # Kubernetes cluster performance tuning
 # Applies: CPU governor, THP, network buffers, containerd optimizations
-# Reboot: triggered via kured sentinel if containerd driver changes applied
+# Containerd changes require Python 3.11+ and native config validation.
 
 - name: Phase 1 — sysctl + CPU governor + THP (all nodes, zero downtime)
   hosts: kubernetes
@@ -71,41 +71,22 @@
         - key: net.ipv4.tcp_slow_start_after_idle
           value: "0"
 
-- name: Phase 2 — containerd tuning (shim-safe restart, no drain needed)
+- name: Phase 2 — containerd tuning (serial restart)
   hosts: kubernetes
   become: true
   gather_facts: false
   serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_remote_tmp: /var/lib/ansible-maintenance/tmp
 
   tasks:
     - name: Patch containerd config — SystemdCgroup + max_concurrent_downloads
-      ansible.builtin.shell: |
-        python3 - << 'EOF'
-        import re
-
-        path = "/etc/containerd/config.toml"
-        content = open(path).read()
-        changed = False
-
-        # Fix 1: SystemdCgroup = true in runc options block
-        if "SystemdCgroup = true" not in content:
-            content = re.sub(
-                r"(\[plugins\.'io\.containerd\.cri\.v1\.runtime'\.containerd\.runtimes\.runc\.options\]\n(?:[ \t]+\w[^\n]*\n)*)",
-                lambda m: m.group(0).rstrip("\n") + "\n            SystemdCgroup = true\n",
-                content
-            )
-            changed = True
-
-        # Fix 2: max_concurrent_downloads = 10 (set in both locations)
-        content, n1 = re.subn(r"max_concurrent_downloads = \d+", "max_concurrent_downloads = 10", content)
-        if n1 > 0:
-            changed = True
-
-        open(path, "w").write(content)
-        print("changed" if changed else "ok")
-        EOF
+      ansible.builtin.script:
+        cmd: files/tune_containerd.py /etc/containerd/config.toml
+        executable: python3 -B
       register: containerd_patch
-      changed_when: "'changed' in containerd_patch.stdout"
+      changed_when: "(containerd_patch.stdout.splitlines() | last | default('')) == 'changed'"
       notify:
         - Restart containerd
         - Wait for containerd to be ready

@@ -1,102 +1,255 @@
 ---
-- name: Upgrade Kubernetes nodes without rebooting
+- name: Maintain Kubernetes node OS packages with kured-owned reboots
   hosts: kubernetes
   become: true
   gather_facts: false
   serial: 1
-
+  any_errors_fatal: true
   vars:
     aur_user: ansible
+    maintenance_node: "{{ 'kube-controller' if inventory_hostname == 'kube' else inventory_hostname }}"
+    maintenance_ssh_argv: [ssh, -o, BatchMode=yes, -o, ConnectTimeout=10, -o, ServerAliveInterval=5, -o, ServerAliveCountMax=2, -i, /home/ivan/.ssh/ansible, ansible@kube]
+    maintenance_kubectl_argv: [doas, kubectl, --kubeconfig=/etc/kubernetes/admin.conf, --request-timeout=10s]
+    maintenance_delete_emptydir_data: false
+    ansible_remote_tmp: /var/lib/ansible-maintenance/tmp
 
   tasks:
-    - name: Check pacman database lock
+    - name: Require explicit consent for emptyDir deletion by native kured drain
+      ansible.builtin.assert:
+        that: maintenance_delete_emptydir_data | bool
+        fail_msg: Native kured drain can delete emptyDir data. Set maintenance_delete_emptydir_data=true only after approving this loss; otherwise use a separately reviewed kured policy.
+
+    - name: Discover cluster health and kured configuration
+      ansible.builtin.include_tasks: tasks/maintenance-snapshot.yml
+
+    - name: Gate maintenance on healthy workloads and supported kured coordination
+      ansible.builtin.command:
+        argv: ['{{ ansible_playbook_python }}', -B, -c, "{{ lookup('ansible.builtin.file', playbook_dir + '/files/maintenance_health.py') }}"]
+        stdin: "{{ {'resources': maintenance_resources.stdout | from_json, 'version': maintenance_api.stdout | from_json, 'node': maintenance_node} | to_json }}"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+        ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') }}"
+      become: false
+      register: maintenance_preflight
+      changed_when: false
+
+    - name: Retain original node identity
+      ansible.builtin.set_fact:
+        maintenance_baseline: "{{ maintenance_preflight.stdout | from_json }}"
+
+    - name: Discover installed packages before mutations
+      ansible.builtin.command:
+        argv: [pacman, -Q]
+      register: maintenance_packages_before
+      changed_when: false
+
+    - name: Discover protected Kubernetes package versions
+      ansible.builtin.command:
+        argv: [pacman, -Q, kubeadm, kubelet, kubectl]
+      register: maintenance_protected_before
+      changed_when: false
+
+    - name: Discover Kubernetes binary versions
+      ansible.builtin.command:
+        argv: "{{ item }}"
+      loop:
+        - [kubeadm, version, -o, short]
+        - [kubelet, --version]
+        - [kubectl, version, --client, -o, json]
+      register: maintenance_binaries
+      changed_when: false
+
+    - name: Require exact installed Kubernetes version alignment
+      ansible.builtin.assert:
+        that:
+          - maintenance_binaries.results[0].stdout | trim == maintenance_baseline.version
+          - maintenance_binaries.results[1].stdout.split()[-1] == maintenance_baseline.version
+          - (maintenance_binaries.results[2].stdout | from_json).clientVersion.gitVersion == maintenance_baseline.version
+        fail_msg: Resolve Kubernetes package/version compatibility separately; this play never runs kubeadm upgrade.
+
+    - name: Read host boot identity
+      ansible.builtin.slurp:
+        src: /proc/sys/kernel/random/boot_id
+      register: maintenance_boot_before
+
+    - name: Verify Kubernetes node mapping matches the managed host
+      ansible.builtin.assert:
+        that: maintenance_boot_before.content | b64decode | trim == maintenance_baseline.boot
+
+    - name: Inspect lock and reboot markers before mutation
       ansible.builtin.stat:
-        path: /var/lib/pacman/db.lck
-      register: pacman_lock
+        path: "{{ item }}"
+      loop:
+        - /var/lib/pacman/db.lck
+        - /var/lib/kured/reboot-required
+        - /var/run/reboot-required
+      register: maintenance_markers
 
-    - name: Stop if pacman database is locked
-      ansible.builtin.fail:
-        msg: "pacman database is locked on {{ inventory_hostname }}: /var/lib/pacman/db.lck exists"
-      when: pacman_lock.stat.exists
+    - name: Reject package activity or an already requested kured reboot
+      ansible.builtin.assert:
+        that:
+          - not maintenance_markers.results[0].stat.exists
+          - not maintenance_markers.results[1].stat.exists
+        fail_msg: Resolve existing package activity or kured reboot request before starting maintenance.
 
-    - name: Update Arch and CachyOS keyrings first
+    - name: Read required boot-only sentinel cleanup rule
+      ansible.builtin.slurp:
+        src: /etc/tmpfiles.d/kured-maintenance.conf
+      register: maintenance_cleanup
+
+    - name: Require boot-only removal of the dedicated disk sentinel
+      ansible.builtin.assert:
+        that: maintenance_cleanup.content | b64decode | trim == 'r! /var/lib/kured/reboot-required - - - -'
+        fail_msg: Provision the documented boot-only tmpfiles rule before maintenance; a persistent sentinel can cause a reboot loop.
+
+    - name: Verify boot tmpfiles service ran successfully
       ansible.builtin.command:
-        argv:
-          - paru
-          - -S
-          - --needed
-          - --noconfirm
-          - archlinux-keyring
-          - cachyos-keyring
-      become: true
-      become_user: "{{ aur_user }}"
-      environment:
-        LANG: C
-        LC_ALL: C
-      register: keyring_update
-      changed_when: "'there is nothing to do' not in (keyring_update.stdout + keyring_update.stderr | lower)"
-
-    - name: Synchronize pacman databases
-      ansible.builtin.command:
-        argv:
-          - paru
-          - -Sy
-      become: true
-      become_user: "{{ aur_user }}"
+        argv: [systemctl, is-active, systemd-tmpfiles-setup.service]
       changed_when: false
 
-    - name: Check available upgrades
-      ansible.builtin.command:
-        argv:
-          - paru
-          - -Qu
-      become: true
-      become_user: "{{ aur_user }}"
-      register: paru_upgrades
-      changed_when: false
-      failed_when: paru_upgrades.rc not in [0, 1]
+    - name: Drain and maintain one node; failures stop every remaining host
+      block:
+        - name: Drain using eviction and PDB protection
+          ansible.builtin.command:
+            argv: "{{ ['timeout', '330s'] + maintenance_ssh_argv + [(maintenance_kubectl_argv + ['drain', maintenance_node, '--ignore-daemonsets', '--timeout=300s'] + (['--delete-emptydir-data'] if maintenance_delete_emptydir_data | bool else [])) | map('quote') | join(' ')] }}"
+            expand_argument_vars: false
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+            ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') }}"
+          become: false
+          changed_when: true
 
-    - name: Show packages to be upgraded
-      ansible.builtin.debug:
-        msg: "{{ paru_upgrades.stdout_lines }}"
-      when: paru_upgrades.stdout != ""
+        - name: Upgrade OS packages while excluding all protected Kubernetes packages
+          ansible.builtin.command:
+            argv: [paru, -Syu, --noconfirm, --ignore, 'kubeadm,kubelet,kubectl,kubernetes,kubernetes-*']
+          become_user: "{{ aur_user }}"
+          environment:
+            LANG: C
+            LC_ALL: C
+          register: maintenance_upgrade
+          changed_when: "'there is nothing to do' not in (maintenance_upgrade.stdout + maintenance_upgrade.stderr | lower)"
 
-    - name: Upgrade all packages
-      ansible.builtin.command:
-        argv:
-          - paru
-          - -Syu
-          - --noconfirm
-      become: true
-      become_user: "{{ aur_user }}"
-      environment:
-        LANG: C
-        LC_ALL: C
-      register: paru_upgrade
-      changed_when: "'there is nothing to do' not in (paru_upgrade.stdout + paru_upgrade.stderr | lower)"
-      when: paru_upgrades.stdout != ""
+        - name: Verify protected package versions after the transaction
+          ansible.builtin.command:
+            argv: [pacman, -Q, kubeadm, kubelet, kubectl]
+          register: maintenance_protected_after
+          changed_when: false
 
-    - name: Verify kubelet is active
-      ansible.builtin.command:
-        argv:
-          - systemctl
-          - is-active
-          - kubelet
-      changed_when: false
+        - name: Fail if protected package state moved
+          ansible.builtin.assert:
+            that: maintenance_protected_after.stdout == maintenance_protected_before.stdout
+            fail_msg: Protected Kubernetes packages changed. Leave this node cordoned and recover its original versions before continuing.
 
-    - name: Verify containerd is active
-      ansible.builtin.command:
-        argv:
-          - systemctl
-          - is-active
-          - containerd
-      changed_when: false
+        - name: Read package state after maintenance
+          ansible.builtin.command:
+            argv: [pacman, -Q]
+          register: maintenance_packages_after
+          changed_when: false
 
-    - name: Check reboot sentinel for kured
-      ansible.builtin.stat:
-        path: /var/run/reboot-required
-      register: reboot_required
+        - name: Inspect independent pending reboot marker
+          ansible.builtin.stat:
+            path: /var/run/reboot-required
+          register: maintenance_pending_after
 
-    - name: Show reboot sentinel state
-      ansible.builtin.debug:
-        msg: "reboot sentinel present on {{ inventory_hostname }}: {{ reboot_required.stat.exists }}"
+        - name: Decide whether kured must reboot and record maintenance boundary
+          ansible.builtin.set_fact:
+            maintenance_reboot: "{{ maintenance_packages_before.stdout != maintenance_packages_after.stdout or maintenance_markers.results[2].stat.exists or maintenance_pending_after.stat.exists }}"
+            maintenance_return_success: false
+
+        - name: Record post-transaction time on the kubectl delegate
+          ansible.builtin.command:
+            argv: [date, -u, '+%Y-%m-%dT%H:%M:%S.%NZ']
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+            ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') }}"
+          become: false
+          register: maintenance_clock
+          changed_when: false
+
+        - name: Retain maintenance boundary
+          ansible.builtin.set_fact:
+            maintenance_after: "{{ maintenance_clock.stdout | trim }}"
+
+        - name: Restore schedulability so default kured can own its drain and uncordon
+          ansible.builtin.command:
+            argv: "{{ ['timeout', '30s'] + maintenance_ssh_argv + [(maintenance_kubectl_argv + ['uncordon', maintenance_node]) | map('quote') | join(' ')] }}"
+            expand_argument_vars: false
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+            ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') }}"
+          become: false
+          changed_when: true
+
+        - name: Request reboot through the dedicated kured sentinel
+          ansible.builtin.copy:
+            dest: /var/lib/kured/reboot-required
+            content: "OS maintenance requires reboot\n"
+            mode: '0644'
+          when: maintenance_reboot | bool
+
+        - name: Observe actual reboot and healthy return for at most 15 minutes plus API timeouts
+          ansible.builtin.include_tasks: tasks/maintenance-return.yml
+          loop: "{{ range(60) | list }}"
+          when: not maintenance_return_success | bool
+
+        - name: Stop on missing boot transition or unhealthy return
+          ansible.builtin.assert:
+            that: maintenance_return_success | bool
+            fail_msg: "Kured/health deadline expired: {{ maintenance_return.stderr | default('no healthy observation') }}"
+
+        - name: Wait for managed host connection after kured
+          ansible.builtin.wait_for_connection:
+            timeout: 180
+
+        - name: Verify actual host boot identity after return
+          ansible.builtin.slurp:
+            src: /proc/sys/kernel/random/boot_id
+          register: maintenance_boot_after
+
+        - name: Require host reboot when requested
+          ansible.builtin.assert:
+            that: not maintenance_reboot or (maintenance_boot_after.content | b64decode | trim != maintenance_baseline.boot)
+
+        - name: Recheck protected package versions after return
+          ansible.builtin.command:
+            argv: [pacman, -Q, kubeadm, kubelet, kubectl]
+          register: maintenance_protected_return
+          changed_when: false
+
+        - name: Require protected packages to remain unchanged after reboot
+          ansible.builtin.assert:
+            that: maintenance_protected_return.stdout == maintenance_protected_before.stdout
+
+        - name: Check that boot cleanup consumed the kured sentinel
+          ansible.builtin.stat:
+            path: /var/lib/kured/reboot-required
+          register: maintenance_sentinel_return
+
+        - name: Reject a persistent reboot request
+          ansible.builtin.assert:
+            that: not maintenance_sentinel_return.stat.exists
+            fail_msg: Reboot sentinel remains; reconcile kured immediately to prevent another reboot.
+
+        - name: Verify node services after return
+          ansible.builtin.command:
+            argv: [systemctl, is-active, kubelet, containerd]
+          changed_when: false
+
+      rescue:
+        - name: Stop progression with recovery instructions
+          ansible.builtin.fail:
+            msg: >-
+              Maintenance failed on {{ maintenance_node }}. No further nodes will run.
+              Inspect the failed task, node cordon, workloads/PDBs, package versions,
+              kured logs/lock and /var/lib/kured/reboot-required. A kured request may
+              still be active; reconcile it before manual recovery. Restore health
+              and the original schedulable state before rerunning. No automatic
+              uncordon or competing reboot is attempted during recovery.

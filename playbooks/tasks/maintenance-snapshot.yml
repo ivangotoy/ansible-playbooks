@@ -1,0 +1,28 @@
+---
+- name: Read cluster resources without mutating them
+  ansible.builtin.command:
+    argv: "{{ ['timeout', '30s'] + maintenance_ssh_argv + [(maintenance_kubectl_argv + ['get', 'nodes,pods,daemonsets,deployments,statefulsets,leases', '--all-namespaces', '-o', 'json']) | map('quote') | join(' ')] }}"
+    expand_argument_vars: false
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') }}"
+  become: false
+  register: maintenance_resources
+  changed_when: false
+  failed_when: not (maintenance_observing | default(false) | bool) and maintenance_resources.rc != 0
+
+- name: Read API server version
+  ansible.builtin.command:
+    argv: "{{ ['timeout', '30s'] + maintenance_ssh_argv + [(maintenance_kubectl_argv + ['version', '-o', 'json']) | map('quote') | join(' ')] }}"
+    expand_argument_vars: false
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') }}"
+  become: false
+  register: maintenance_api
+  changed_when: false
+  failed_when: not (maintenance_observing | default(false) | bool) and maintenance_api.rc != 0

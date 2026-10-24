@@ -1,0 +1,33 @@
+---
+- name: Observe only until a successful return
+  when: not maintenance_return_success | bool
+  block:
+    - name: Refresh post-maintenance cluster state
+      ansible.builtin.include_tasks: maintenance-snapshot.yml
+      vars:
+        maintenance_observing: true
+
+    - name: Verify return against the original node identity
+      ansible.builtin.command:
+        argv: ['{{ ansible_playbook_python }}', -B, -c, "{{ lookup('ansible.builtin.file', playbook_dir + '/files/maintenance_health.py') }}"]
+        stdin: "{{ {'resources': maintenance_resources.stdout | from_json, 'version': maintenance_api.stdout | from_json, 'node': maintenance_node, 'baseline': maintenance_baseline, 'after': maintenance_after, 'reboot': maintenance_reboot} | to_json }}"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+        ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') }}"
+      become: false
+      register: maintenance_return
+      changed_when: false
+      failed_when: false
+      when: maintenance_resources.rc == 0 and maintenance_api.rc == 0
+
+    - name: Retain successful executed observation across skipped includes
+      ansible.builtin.set_fact:
+        maintenance_return_success: "{{ maintenance_return.rc == 0 }}"
+      when: not (maintenance_return.skipped | default(false))
+
+    - name: Wait between bounded health observations
+      ansible.builtin.pause:
+        seconds: 15
+      when: not maintenance_return_success | bool
