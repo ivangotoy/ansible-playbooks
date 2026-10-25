@@ -19,6 +19,22 @@ from test_maintenance import ROOT, PYTHON, fixture, load
 
 
 class FlowGateTests(unittest.TestCase):
+    def test_return_poll_interval_preserves_bounded_sleep_budget(self):
+        from ansible.plugins.filter.core import to_bool
+        from jinja2 import Environment
+        tasks = yaml.safe_load((ROOT / 'playbooks/tasks/maintenance-return.yml').read_text())[0]['block']
+        pause, retry = tasks[-2:]
+        self.assertEqual(pause['ansible.builtin.pause']['seconds'], 3)
+        self.assertEqual(pause['when'], retry['when'])
+        environment = Environment()
+        environment.filters['bool'] = to_bool
+        condition = environment.compile_expression(retry['when'])
+        attempts = [n for n in range(1, 1001)
+                    if condition(maintenance_return_success=False, maintenance_return_attempt=n)]
+        self.assertEqual(attempts, list(range(1, 300)))
+        self.assertGreaterEqual(len(attempts) * 3, 59 * 15)
+        self.assertFalse(condition(maintenance_return_success=True, maintenance_return_attempt=1))
+
     def test_fixture_commands_are_local_endpoints(self):
         def inspect(argv, cwd=None, **kwargs):
             work=Path(cwd)
@@ -140,11 +156,18 @@ elif kind == 'ssh':
     argv = shlex.split(argv[-1])
     assert argv[:2] == ['doas','kubectl']
     argv = argv[4:]
-    if argv[0] == 'version': output(dict(serverVersion=dict(gitVersion=s['api'])))
+    if argv[0] == 'version':
+        event('read-version')
+        output(dict(serverVersion=dict(gitVersion=s['api'])))
     elif argv[0] == 'get' and argv[1] == '--raw=/readyz': print('ok')
     elif argv[:3] == ['get','configmap','kubeadm-config']:
         output({'data':{'ClusterConfiguration':'kubernetesVersion: '+s['cluster_config']}})
     elif argv[0] == 'get':
+        event('read-resources')
+        if s.get('return_retry') and host+':uncordon' in s['events'] and host not in s.setdefault('retried', []):
+            s['retried'].append(host)
+            save()
+            sys.exit('fixture: transient return read failure')
         data = json.loads((root / 'resources.json').read_text())
         for obj in data['items']:
             name = obj['metadata']['name']
@@ -194,7 +217,7 @@ else: raise AssertionError((host,kind,argv))
 class AnsibleFlowTests(unittest.TestCase):
     maxDiff = None
 
-    def run_flow(self, target='1.38.0', api='v1.37.1', fail=None, reboot=False, interrupt=None, release='-1', pending=None):
+    def run_flow(self, target='1.38.0', api='v1.37.1', fail=None, reboot=False, interrupt=None, release='-1', pending=None, return_retry=False):
         with tempfile.TemporaryDirectory() as temp:
             work = Path(temp)
             (work / 'files').mkdir()
@@ -226,7 +249,8 @@ class AnsibleFlowTests(unittest.TestCase):
             hosts = ['kube','node-01','node-02']
             packages = {h:{p:'1.37.1-1' for p in ('kubeadm','kubelet','kubectl')} for h in hosts}
             state = dict(target=target,release=release,api=api,cluster_config='v1.37.1',initial=copy.deepcopy(packages),packages=packages,
-                         reported={h:'v1.37.1' for h in hosts},boots={h:'old' for h in hosts},cordon={},events=[],fail=interrupt or fail)
+                         reported={h:'v1.37.1' for h in hosts},boots={h:'old' for h in hosts},cordon={},events=[],fail=interrupt or fail,
+                         return_retry=return_retry)
             if pending:
                 (work / 'node-01/pending.json').write_text(json.dumps(pending))
             (work / 'state.json').write_text(json.dumps(state))
@@ -289,7 +313,7 @@ class AnsibleFlowTests(unittest.TestCase):
             for play in plays:
                 play['become']=False
                 play['vars'].update(ansible_connection='local',ansible_python_interpreter=PYTHON,
-                                    ansible_remote_tmp=str(work/'remote'),maintenance_ssh_argv=[PYTHON,str(script),'remote','ssh'])
+                                    ansible_remote_tmp=str(work/'remote'),maintenance_ssh_argv=[PYTHON,str(script),'{{ inventory_hostname }}','ssh'])
                 transform(play['tasks'])
             (work/'play.yml').write_text(yaml.safe_dump(plays,sort_keys=False))
             (work/'inventory').write_text('[kubernetes]\nnode-01\nnode-02\nkube\n')
@@ -318,6 +342,43 @@ class AnsibleFlowTests(unittest.TestCase):
             final['completed']=[h for h in hosts if (work/h/'completed.json').exists()]
             final['pending']=[h for h in hosts if (work/h/'pending.json').exists()]
             return final,output
+
+    def check_snapshot_reads(self, state, return_observations):
+        # Preparation shares both registered reads across the inventory; the real
+        # per-host health gates and planner consume them before any node runs.
+        expected = ['node-01:read-resources', 'node-01:read-version'] * 2
+        for host in ('kube', 'node-01', 'node-02'):
+            expected.extend([host + ':read-resources', host + ':read-version'])
+            # Require target API before kubelet archive installation.
+            expected.append(host + ':read-version')
+            expected.extend([host + ':read-resources', host + ':read-version'] * return_observations)
+        reads = [event for event in state['events'] if ':read-' in event]
+        self.assertEqual(reads, expected)
+        self.assertEqual(state['completed'], ['kube', 'node-01', 'node-02'])
+        events = state['events']
+        first_drain = events.index('kube:drain')
+        self.assertEqual(sum(e.endswith(':read-resources') for e in events[:first_drain]), 3)
+        for host in ('kube', 'node-01', 'node-02'):
+            start = events.index(host + ':uncordon')
+            following_reads = [e for e in events[start + 1:] if ':read-' in e]
+            self.assertEqual(following_reads[:2 * return_observations],
+                             [host + ':' + read for _ in range(return_observations)
+                              for read in ('read-resources', 'read-version')])
+
+    def test_shared_preparation_and_fresh_node_snapshots_stop_on_success(self):
+        state, output = self.run_flow(target='1.37.1', release='-2')
+        self.check_snapshot_reads(state, return_observations=1)
+        self.assertNotIn('Pausing for', output)
+        self.assertEqual(output.count('Healthy return observed'), 3)
+
+    def test_unsuccessful_return_retries_with_fresh_snapshots(self):
+        state, output = self.run_flow(target='1.37.1', release='-2', return_retry=True)
+        self.check_snapshot_reads(state, return_observations=2)
+        self.assertEqual(state['retried'], ['kube', 'node-01', 'node-02'])
+        self.assertIn('fixture: transient return read failure', output)
+        self.assertEqual(output.count('Observation 1 rejected:'), 3)
+        self.assertEqual(output.count('Pausing for'), 3)
+        self.assertEqual(output.count('Healthy return observed'), 3)
 
     def test_minor_transition_orders_backup_apply_and_sequential_workers(self):
         state,_=self.run_flow()

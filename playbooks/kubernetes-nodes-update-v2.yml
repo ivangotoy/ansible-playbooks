@@ -38,6 +38,8 @@
       fail_msg: Do not limit this maintenance play; all nodes must be prepared and gated.
   - name: Discover cluster health and kured configuration
     ansible.builtin.include_tasks: tasks/maintenance-snapshot.yml
+    vars:
+      maintenance_shared_snapshot: true
   - &id001
     name: Gate maintenance on healthy workloads and supported kured coordination
     ansible.builtin.command:
@@ -142,6 +144,8 @@
     ansible.builtin.include_tasks: tasks/maintenance-prepare.yml
   - name: Refresh cluster after all package preparation
     ansible.builtin.include_tasks: tasks/maintenance-snapshot.yml
+    vars:
+      maintenance_shared_snapshot: true
   - *id001
   - name: Retain refreshed pre-mutation identity
     ansible.builtin.set_fact:

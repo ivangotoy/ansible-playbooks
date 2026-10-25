@@ -419,7 +419,7 @@ class PlaybookTests(unittest.TestCase):
         self.assertEqual(observation['when'], 'not maintenance_return_success | bool')
         self.assertNotIn('when', gate)  # Do not skip the success report after setting the fact.
         self.assertIn('rescue', gate['block'][1])
-        self.assertEqual(gate['block'][-1]['when'], 'not maintenance_return_success | bool and maintenance_return_attempt | int < 60')
+        self.assertEqual(gate['block'][-1]['when'], 'not maintenance_return_success | bool and maintenance_return_attempt | int < 300')
         self.assertIn('ansible.builtin.assert', play['tasks'][-1]['block'][play['tasks'][-1]['block'].index(observation) + 1])
 
     def test_debian_polling_orders_cache_before_upgrade(self):

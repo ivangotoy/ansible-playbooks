@@ -57,9 +57,9 @@
 
     - name: Wait between bounded health observations
       ansible.builtin.pause:
-        seconds: 15
-      when: not maintenance_return_success | bool and maintenance_return_attempt | int < 60
+        seconds: 3
+      when: not maintenance_return_success | bool and maintenance_return_attempt | int < 300
 
     - name: Retry only an unsuccessful observation within the deadline
       ansible.builtin.include_tasks: maintenance-return.yml
-      when: not maintenance_return_success | bool and maintenance_return_attempt | int < 60
+      when: not maintenance_return_success | bool and maintenance_return_attempt | int < 300
