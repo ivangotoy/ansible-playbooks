@@ -1,0 +1,45 @@
+- name: Create unique root-owned package staging
+  ansible.builtin.tempfile:
+    state: directory
+    path: /var/lib/ansible-maintenance
+    prefix: packages-
+  register: maintenance_stage
+- name: Permit downloader traversal of package staging
+  ansible.builtin.file:
+    path: '{{ maintenance_stage.path }}'
+    mode: '0755'
+- name: Create unprivileged AUR build staging
+  ansible.builtin.file:
+    path: '{{ maintenance_stage.path }}/aur'
+    state: directory
+    owner: '{{ aur_user }}'
+    mode: '0700'
+- name: Prepare signed repository archives before any drain
+  ansible.builtin.script:
+    cmd: files/maintenance_packages.py repo {{ maintenance_stage.path | quote }}
+    executable: python3
+  environment:
+    TMPDIR: /var/lib/ansible-maintenance/tmp
+  register: maintenance_repo_result
+- name: Build selected AUR archives without installing build dependencies
+  ansible.builtin.script:
+    cmd: files/maintenance_packages.py aur {{ (maintenance_stage.path + "/aur") | quote }} {{ ('--aur-cache ' + (maintenance_aur_cache | quote)) if maintenance_aur_cache is defined else '' }}
+    executable: python3
+  become_user: '{{ aur_user }}'
+  environment:
+    TMPDIR: /var/lib/ansible-maintenance/tmp
+  register: maintenance_aur_result
+- name: Seal and validate the complete local archive transaction
+  ansible.builtin.script:
+    cmd: files/maintenance_packages.py seal {{ maintenance_stage.path | quote }} --aur-stage {{ (maintenance_stage.path +
+      "/aur") | quote }}
+    executable: python3
+  register: maintenance_sealed
+- name: Retain prepared transaction and Kubernetes input
+  ansible.builtin.set_fact:
+    maintenance_manifest: '{{ maintenance_sealed.stdout | from_json }}'
+
+- name: Reject package changes since initial host inspection
+  ansible.builtin.assert:
+    that: maintenance_manifest.installed == dict(maintenance_packages_before.stdout_lines | map('split'))
+    fail_msg: Installed packages changed during preparation; prepare a new transaction before draining.

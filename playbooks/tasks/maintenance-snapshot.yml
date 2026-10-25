@@ -7,7 +7,7 @@
   vars:
     ansible_connection: local
     ansible_python_interpreter: "{{ ansible_playbook_python }}"
-    ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') }}"
+    ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'HOME') + '/.ansible/tmp' }}"
   become: false
   register: maintenance_resources
   changed_when: false
@@ -21,7 +21,7 @@
   vars:
     ansible_connection: local
     ansible_python_interpreter: "{{ ansible_playbook_python }}"
-    ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') }}"
+    ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'HOME') + '/.ansible/tmp' }}"
   become: false
   register: maintenance_api
   changed_when: false

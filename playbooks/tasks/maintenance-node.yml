@@ -1,0 +1,221 @@
+- name: Select node-local transition plan
+  ansible.builtin.set_fact:
+    maintenance_node_plan: '{{ maintenance_plan.nodes | selectattr("host", "equalto", inventory_hostname) | first }}'
+- name: Inspect lock and reboot markers before mutation
+  ansible.builtin.stat:
+    path: '{{ item }}'
+  loop:
+  - /var/lib/pacman/db.lck
+  - /var/lib/kured/reboot-required
+  - /var/run/reboot-required
+  register: maintenance_markers
+- name: Reject package activity or an already requested kured reboot
+  ansible.builtin.assert:
+    that:
+    - not maintenance_markers.results[0].stat.exists
+    - not maintenance_markers.results[1].stat.exists
+    fail_msg: Resolve existing package activity or kured reboot request before starting maintenance.
+- name: Recheck pinned archives and installed state before drain
+  ansible.builtin.script:
+    cmd: files/maintenance_packages.py verify {{ maintenance_stage.path | quote }}
+    executable: python3
+  changed_when: false
+- name: Refresh cluster health before next node
+  ansible.builtin.include_tasks: maintenance-snapshot.yml
+- name: Gate maintenance on healthy workloads and supported kured coordination
+  ansible.builtin.command:
+    argv:
+    - '{{ ansible_playbook_python }}'
+    - -B
+    - -c
+    - '{{ lookup(''ansible.builtin.file'', playbook_dir + ''/files/maintenance_health.py'') }}'
+    stdin: '{{ {''resources'': maintenance_resources.stdout | from_json, ''version'': maintenance_api.stdout | from_json,
+      ''node'': maintenance_node, ''transition'': true} | to_json }}'
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: '{{ ansible_playbook_python }}'
+    ansible_remote_tmp: '{{ lookup(''ansible.builtin.env'', ''HOME'') + ''/.ansible/tmp'' }}'
+  become: false
+  register: maintenance_preflight
+  changed_when: false
+- name: Require API to remain at the planned phase boundary
+  ansible.builtin.assert:
+    that: (maintenance_api.stdout | from_json).serverVersion.gitVersion == (maintenance_initial_api if maintenance_node_plan.control_plane
+      and maintenance_plan.upgrade_api else maintenance_plan.target)
+    fail_msg: API changed outside this prepared transition; stop and prepare again.
+- name: Reject replacement node since initial preflight
+  ansible.builtin.assert:
+    that: (maintenance_preflight.stdout | from_json).uid == maintenance_node_plan.uid
+- name: Retain node return target and boot identity
+  ansible.builtin.set_fact:
+    maintenance_baseline: '{{ (maintenance_preflight.stdout | from_json) | combine({"target": maintenance_plan.target}) }}'
+- name: Read host boot identity
+  ansible.builtin.slurp:
+    src: /proc/sys/kernel/random/boot_id
+  register: maintenance_boot_before
+- name: Verify Kubernetes node mapping matches the managed host
+  ansible.builtin.assert:
+    that: maintenance_boot_before.content | b64decode | trim == maintenance_baseline.boot
+- name: Drain and maintain one node; failures stop every remaining host
+  block:
+  - name: Retain unfinished target and identity before any mutation
+    ansible.builtin.set_fact:
+      maintenance_pending_work:
+        target: '{{ maintenance_plan.target }}'
+        candidates: '{{ maintenance_plan.candidates }}'
+        node: '{{ maintenance_node }}'
+        uid: '{{ maintenance_node_plan.uid }}'
+        apply_complete: '{{ not maintenance_node_plan.apply }}'
+  - name: Persist unfinished node work before drain and package mutation
+    ansible.builtin.copy:
+      dest: /var/lib/ansible-maintenance/pending.json
+      content: '{{ maintenance_pending_work | to_nice_json }}'
+      mode: '0600'
+  - name: Drain using eviction and PDB protection
+    ansible.builtin.command:
+      argv: '{{ [''timeout'', ''330s''] + maintenance_ssh_argv + [(maintenance_kubectl_argv + [''drain'', maintenance_node,
+        ''--ignore-daemonsets'', ''--timeout=300s''] + ([''--delete-emptydir-data''] if maintenance_delete_emptydir_data |
+        bool else [])) | map(''quote'') | join('' '')] }}'
+      expand_argument_vars: false
+    delegate_to: localhost
+    vars:
+      ansible_connection: local
+      ansible_python_interpreter: '{{ ansible_playbook_python }}'
+      ansible_remote_tmp: '{{ lookup(''ansible.builtin.env'', ''HOME'') + ''/.ansible/tmp'' }}'
+    become: false
+    changed_when: true
+  - name: Coordinate pinned kubeadm and node package transaction
+    ansible.builtin.include_tasks: maintenance-kubeadm.yml
+  - name: Read package state after maintenance
+    ansible.builtin.command:
+      argv:
+      - pacman
+      - -Q
+    register: maintenance_packages_after
+    changed_when: false
+  - name: Inspect independent pending reboot marker
+    ansible.builtin.stat:
+      path: /var/run/reboot-required
+    register: maintenance_pending_after
+  - name: Decide whether kured must reboot and record maintenance boundary
+    ansible.builtin.set_fact:
+      maintenance_reboot: '{{ maintenance_markers.results[2].stat.exists or maintenance_pending_after.stat.exists }}'
+      maintenance_return_success: false
+      maintenance_return_attempt: 0
+  - name: Record post-transaction time on the kubectl delegate
+    ansible.builtin.command:
+      argv:
+      - date
+      - -u
+      - +%Y-%m-%dT%H:%M:%S.%NZ
+    delegate_to: localhost
+    vars:
+      ansible_connection: local
+      ansible_python_interpreter: '{{ ansible_playbook_python }}'
+      ansible_remote_tmp: '{{ lookup(''ansible.builtin.env'', ''HOME'') + ''/.ansible/tmp'' }}'
+    become: false
+    register: maintenance_clock
+    changed_when: false
+  - name: Retain maintenance boundary
+    ansible.builtin.set_fact:
+      maintenance_after: '{{ maintenance_clock.stdout | trim }}'
+  - name: Restore schedulability so default kured can own its drain and uncordon
+    ansible.builtin.command:
+      argv: '{{ [''timeout'', ''30s''] + maintenance_ssh_argv + [(maintenance_kubectl_argv + [''uncordon'', maintenance_node])
+        | map(''quote'') | join('' '')] }}'
+      expand_argument_vars: false
+    delegate_to: localhost
+    vars:
+      ansible_connection: local
+      ansible_python_interpreter: '{{ ansible_playbook_python }}'
+      ansible_remote_tmp: '{{ lookup(''ansible.builtin.env'', ''HOME'') + ''/.ansible/tmp'' }}'
+    become: false
+    changed_when: true
+  - name: Request reboot through the dedicated kured sentinel
+    ansible.builtin.copy:
+      dest: /var/lib/kured/reboot-required
+      content: 'OS maintenance requires reboot
+
+        '
+      mode: '0644'
+    when: maintenance_reboot | bool
+  - name: Observe actual reboot and healthy return for at most 15 minutes plus API timeouts
+    ansible.builtin.include_tasks: maintenance-return.yml
+    when: not maintenance_return_success | bool
+  - name: Stop on missing boot transition or unhealthy return
+    ansible.builtin.assert:
+      that: maintenance_return_success | bool
+      fail_msg: 'Kured/health deadline expired: {{ maintenance_return_reason | default(''no healthy observation'') }}'
+  - name: Wait for managed host connection after kured
+    ansible.builtin.wait_for_connection:
+      timeout: 180
+  - name: Verify actual host boot identity after return
+    ansible.builtin.slurp:
+      src: /proc/sys/kernel/random/boot_id
+    register: maintenance_boot_after
+  - name: Require host reboot when requested
+    ansible.builtin.assert:
+      that: not maintenance_reboot or (maintenance_boot_after.content | b64decode | trim != maintenance_baseline.boot)
+  - name: Recheck protected package versions after return
+    ansible.builtin.command:
+      argv:
+      - pacman
+      - -Q
+      - kubeadm
+      - kubelet
+      - kubectl
+    register: maintenance_protected_return
+    changed_when: false
+  - name: Require all Kubernetes packages at the pinned target after return
+    ansible.builtin.assert:
+      that: dict(maintenance_protected_return.stdout_lines | map("split")) == maintenance_plan.candidates
+  - name: Check that boot cleanup consumed the kured sentinel
+    ansible.builtin.stat:
+      path: /var/lib/kured/reboot-required
+    register: maintenance_sentinel_return
+  - name: Reject a persistent reboot request
+    ansible.builtin.assert:
+      that: not maintenance_sentinel_return.stat.exists
+      fail_msg: Reboot sentinel remains; reconcile kured immediately to prevent another reboot.
+  - name: Verify node services after return
+    ansible.builtin.command:
+      argv:
+      - systemctl
+      - is-active
+      - kubelet
+      - containerd
+    changed_when: false
+  - name: Require API readiness after node return
+    ansible.builtin.command:
+      argv: '{{ [''timeout'', ''30s''] + maintenance_ssh_argv + [(maintenance_kubectl_argv + [''get'', ''--raw=/readyz''])
+        | map(''quote'') | join('' '')] }}'
+      expand_argument_vars: false
+    delegate_to: localhost
+    vars:
+      ansible_connection: local
+      ansible_python_interpreter: '{{ ansible_playbook_python }}'
+      ansible_remote_tmp: '{{ lookup(''ansible.builtin.env'', ''HOME'') + ''/.ansible/tmp'' }}'
+    become: false
+    changed_when: false
+  - name: Record node completion only after healthy scheduling and services
+    ansible.builtin.copy:
+      dest: /var/lib/ansible-maintenance/completed.json
+      content: '{{ {''target'': maintenance_plan.target, ''node'': maintenance_node, ''uid'': maintenance_node_plan.uid, ''after'':
+        maintenance_after} | to_nice_json }}
+
+        '
+      mode: '0600'
+  - name: Clear unfinished work only after all healthy return gates
+    ansible.builtin.file:
+      path: /var/lib/ansible-maintenance/pending.json
+      state: absent
+  rescue:
+  - name: Stop progression with recovery instructions
+    ansible.builtin.fail:
+      msg: Maintenance failed on {{ maintenance_node }}. No further nodes will run. Inspect the failed task, node cordon,
+        workloads/PDBs, package versions, kured logs/lock and /var/lib/kured/reboot-required. A kured request may still be
+        active; reconcile it before manual recovery. Restore health and the original schedulable state before rerunning. No
+        automatic uncordon or competing reboot is attempted during recovery.
+  when: maintenance_manifest.archives | length > 0 or maintenance_node_plan.reconcile or (maintenance_node_plan.control_plane
+    and maintenance_plan.upgrade_api) or maintenance_markers.results[2].stat.exists

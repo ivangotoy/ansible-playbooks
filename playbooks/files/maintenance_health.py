@@ -28,12 +28,31 @@ def check(data):
     server = data['version']['serverVersion']['gitVersion']
     minor = lambda v: re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?', v)
     require(minor(version) and minor(server), 'Unrecognized Kubernetes version')
-    require(minor(version).groups()[:2] == minor(server).groups()[:2],
-            'Maintenance requires kubelet and API server on the same minor version')
+    if data.get('transition') or data.get('baseline', {}).get('target'):
+        node_version = tuple(map(int, minor(version).groups()))
+        api_version = tuple(map(int, minor(server).groups()))
+        require(node_version <= api_version and node_version[0] == api_version[0] and
+                api_version[1] - node_version[1] <= 1, 'Unsupported transition version skew')
+    else:
+        require(minor(version).groups()[:2] == minor(server).groups()[:2],
+                'Maintenance requires kubelet and API server on the same minor version')
     pods = [x for x in objects if x['kind'] == 'Pod']
     for pod in pods:
         status = pod.get('status', {})
         if status.get('phase') == 'Succeeded':
+            continue
+        controllers = [o for o in pod['metadata'].get('ownerReferences', [])
+                       if o.get('controller') is True]
+        job_owned = (len(controllers) == 1 and
+                     controllers[0].get('apiVersion') == 'batch/v1' and
+                     controllers[0].get('kind') == 'Job' and
+                     controllers[0].get('name') and controllers[0].get('uid'))
+        if job_owned:
+            require(not pod['metadata'].get('deletionTimestamp') and
+                    status.get('phase') in ('Pending', 'Running'),
+                    'Job pod unhealthy: ' + pod['metadata']['name'] +
+                    ' phase=' + str(status.get('phase')) +
+                    ' reason=' + str(status.get('reason', '')))
             continue
         require(not pod['metadata'].get('deletionTimestamp') and
                 status.get('phase') == 'Running' and
@@ -114,11 +133,15 @@ def check(data):
     require(datetime.timedelta(0) <= now - renewed < datetime.timedelta(seconds=60), 'Node lease is stale')
     boot = node['status']['nodeInfo']['bootID']
     if 'baseline' in data:
-        require(version == data['baseline']['version'], 'Kubelet version changed during OS maintenance')
+        expected = data['baseline'].get('target', data['baseline']['version'])
+        require(version == expected, 'Kubelet version differs from expected maintenance target')
+        if 'target' in data['baseline']:
+            require(server == expected, 'API differs from maintenance target')
+            require(node['metadata']['uid'] == data['baseline']['uid'], 'Node UID changed')
         require(renewed > timestamp(data['after']), 'No fresh post-maintenance lease')
         if data['reboot']:
             require(boot != data['baseline']['boot'], 'Waiting for actual kured boot-ID change')
-    return {'version': version, 'boot': boot, 'lease': lease['spec']['renewTime']}
+    return {'uid': node['metadata'].get('uid'), 'version': version, 'boot': boot, 'lease': lease['spec']['renewTime']}
 
 
 if __name__ == '__main__':

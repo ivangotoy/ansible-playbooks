@@ -203,6 +203,37 @@ def fixture():
 
 
 class HealthTests(unittest.TestCase):
+    def test_job_pod_lifecycle_and_controller_ownership(self):
+        owner = dict(apiVersion='batch/v1', kind='Job', name='scan', uid='scan-uid', controller=True)
+        for phase, deleting, accepted in [('Pending', False, True), ('Running', False, True),
+                                          ('Succeeded', False, True), ('Failed', False, False),
+                                          ('Unknown', False, False), ('Pending', True, False)]:
+            with self.subTest(phase=phase, deleting=deleting):
+                data = fixture()
+                pod = {'kind': 'Pod', 'metadata': {'name': 'scan-pod', 'namespace': 'trivy',
+                       'ownerReferences': [owner]}, 'status': {'phase': phase}}
+                if deleting:
+                    pod['metadata']['deletionTimestamp'] = '2026-01-01T00:00:00Z'
+                data['resources']['items'].append(pod)
+                if accepted:
+                    health.check(data)
+                else:
+                    with self.assertRaisesRegex(ValueError, 'scan-pod'):
+                        health.check(data)
+        for change in [dict(controller=False), dict(controller='true'), dict(kind='CronJob'),
+                       dict(apiVersion='other/v1'), dict(uid=''), dict(name='')]:
+            data = fixture()
+            data['resources']['items'].append({'kind': 'Pod', 'metadata': {'name': 'scan-pod',
+                'ownerReferences': [owner | change]}, 'status': {'phase': 'Pending'}})
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'Workload unhealthy'):
+                health.check(data)
+        data = fixture()
+        data['resources']['items'].append({'kind': 'Pod', 'metadata': {'name': 'scan-pod',
+            'labels': {'job-name': 'scan'}, 'ownerReferences': [owner, owner | {'uid': 'other'}]},
+            'status': {'phase': 'Pending'}})
+        with self.assertRaisesRegex(ValueError, 'Workload unhealthy'):
+            health.check(data)
+
     def test_ready(self):
         self.assertEqual(health.check(fixture())['boot'], 'old')
 
@@ -313,27 +344,54 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)['boot'], 'old')
 
 
+def delegated_tasks():
+    def walk(tasks):
+        for task in tasks:
+            if task.get('delegate_to') == 'localhost':
+                yield task
+            for key in ('block', 'rescue', 'always'):
+                yield from walk(task.get(key, []))
+    play = yaml.safe_load((ROOT / 'playbooks/kubernetes-nodes-update-v2.yml').read_text())[0]
+    tasks = list(walk(play['tasks']))
+    for name in ('maintenance-snapshot', 'maintenance-return', 'maintenance-node', 'maintenance-kubeadm'):
+        tasks.extend(walk(yaml.safe_load((ROOT / f'playbooks/tasks/{name}.yml').read_text())))
+    return tasks
+
+
 class PlaybookTests(unittest.TestCase):
-    def test_serial_global_failure_and_drain_gates(self):
+    def test_all_controller_staging_uses_home(self):
+        tasks = delegated_tasks()
+        self.assertGreaterEqual(len(tasks), 7)
+        for task in tasks:
+            with self.subTest(task=task['name']):
+                self.assertEqual(task['vars']['ansible_remote_tmp'],
+                                 "{{ lookup('ansible.builtin.env', 'HOME') + '/.ansible/tmp' }}")
         play = yaml.safe_load((ROOT / 'playbooks/kubernetes-nodes-update-v2.yml').read_text())[0]
+        self.assertEqual(play['vars']['ansible_remote_tmp'], '/var/lib/ansible-maintenance/tmp')
+
+    def test_serial_global_failure_and_drain_gates(self):
+        play = yaml.safe_load((ROOT / 'playbooks/kubernetes-nodes-update-v2.yml').read_text())[1]
+        play['tasks'] = yaml.safe_load((ROOT / 'playbooks/tasks/maintenance-node.yml').read_text())
         self.assertEqual(play['serial'], 1)
         self.assertTrue(play['any_errors_fatal'])
         block = play['tasks'][-1]
         self.assertIn('ansible.builtin.fail', block['rescue'][0])
         tasks = block['block']
-        self.assertIn('drain', tasks[0]['ansible.builtin.command']['argv'])
-        self.assertNotIn('--force', tasks[0]['ansible.builtin.command']['argv'])
-        self.assertNotIn('ignore_errors', tasks[0])
-        self.assertEqual(tasks[1]['ansible.builtin.command']['argv'][1], '-Syu')
-        self.assertIn('--ignore', tasks[1]['ansible.builtin.command']['argv'])
-        self.assertFalse(play['vars']['maintenance_delete_emptydir_data'])
-        self.assertTrue(any('maintenance_packages_before.stdout != maintenance_packages_after.stdout' in str(t) for t in tasks))
+        drain = next(t for t in tasks if t['name'] == 'Drain using eviction and PDB protection')
+        self.assertIn('drain', drain['ansible.builtin.command']['argv'])
+        self.assertNotIn('--force', drain['ansible.builtin.command']['argv'])
+        self.assertNotIn('ignore_errors', drain)
+        self.assertEqual(tasks[tasks.index(drain) + 1]['ansible.builtin.include_tasks'], 'maintenance-kubeadm.yml')
+        self.assertEqual(tasks[tasks.index(drain) - 1]['ansible.builtin.copy']['dest'], '/var/lib/ansible-maintenance/pending.json')
+        self.assertEqual(tasks[-1]['ansible.builtin.file'], {'path': '/var/lib/ansible-maintenance/pending.json', 'state': 'absent'})
+        self.assertTrue(play['vars']['maintenance_delete_emptydir_data'])
+        self.assertFalse(any('maintenance_packages_before.stdout != maintenance_packages_after.stdout' in str(t) for t in tasks))
         self.assertTrue(any('maintenance_return_success | bool' in str(t) for t in tasks))
 
     def test_drain_failure_has_no_continuation_override(self):
-        play = yaml.safe_load((ROOT / 'playbooks/kubernetes-nodes-update-v2.yml').read_text())[0]
+        play = {'tasks': yaml.safe_load((ROOT / 'playbooks/tasks/maintenance-node.yml').read_text())}
         block = play['tasks'][-1]
-        drain = block['block'][0]
+        drain = next(t for t in block['block'] if t['name'] == 'Drain using eviction and PDB protection')
         # Ansible command's nonzero drain result must fail into the terminal rescue.
         for override in ('ignore_errors', 'failed_when', 'until'):
             self.assertNotIn(override, drain)
@@ -344,21 +402,24 @@ class PlaybookTests(unittest.TestCase):
     def test_pending_marker_and_package_delta_reboot_expression(self):
         from jinja2 import Environment
         from types import SimpleNamespace as N
-        play = yaml.safe_load((ROOT / 'playbooks/kubernetes-nodes-update-v2.yml').read_text())[0]
+        play = {'tasks': yaml.safe_load((ROOT / 'playbooks/tasks/maintenance-node.yml').read_text())}
         fact = next(t['ansible.builtin.set_fact'] for t in play['tasks'][-1]['block']
                     if 'maintenance_reboot' in t.get('ansible.builtin.set_fact', {}))
         expression = Environment().compile_expression(fact['maintenance_reboot'][2:-2])
-        for changed, before, after, expected in [(False, False, False, False), (True, False, False, True), (False, True, False, True), (False, False, True, True)]:
+        for changed, before, after, expected in [(False, False, False, False), (True, False, False, False), (False, True, False, True), (False, False, True, True)]:
             result = expression(maintenance_packages_before=N(stdout='old'), maintenance_packages_after=N(stdout='new' if changed else 'old'),
                                 maintenance_markers=N(results=[None, None, N(stat=N(exists=before))]), maintenance_pending_after=N(stat=N(exists=after)))
             self.assertEqual(result, expected)
 
     def test_return_observations_stop_after_success_and_have_deadline(self):
-        play = yaml.safe_load((ROOT / 'playbooks/kubernetes-nodes-update-v2.yml').read_text())[0]
-        observation = next(t for t in play['tasks'][-1]['block'] if t.get('ansible.builtin.include_tasks') == 'tasks/maintenance-return.yml')
-        self.assertEqual(observation['loop'], '{{ range(60) | list }}')
+        play = {'tasks': yaml.safe_load((ROOT / 'playbooks/tasks/maintenance-node.yml').read_text())}
+        observation = next(t for t in play['tasks'][-1]['block'] if t.get('ansible.builtin.include_tasks') == 'maintenance-return.yml')
+        self.assertNotIn('loop', observation)
         gate = yaml.safe_load((ROOT / 'playbooks/tasks/maintenance-return.yml').read_text())[0]
-        self.assertEqual(gate['when'], 'not maintenance_return_success | bool')
+        self.assertEqual(observation['when'], 'not maintenance_return_success | bool')
+        self.assertNotIn('when', gate)  # Do not skip the success report after setting the fact.
+        self.assertIn('rescue', gate['block'][1])
+        self.assertEqual(gate['block'][-1]['when'], 'not maintenance_return_success | bool and maintenance_return_attempt | int < 60')
         self.assertIn('ansible.builtin.assert', play['tasks'][-1]['block'][play['tasks'][-1]['block'].index(observation) + 1])
 
     def test_debian_polling_orders_cache_before_upgrade(self):
@@ -395,6 +456,81 @@ class PlaybookTests(unittest.TestCase):
 
 
 class AnsibleRuntimeTests(unittest.TestCase):
+    def test_controller_staging_without_temp_exports(self):
+        # Run on the parent host: actual command modules, local mocked SSH.
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
+            work = Path(directory)
+            mock = work / 'mock_ssh.py'
+            mock.write_text("import sys, shlex, pathlib\n"
+                            "args = shlex.split(sys.argv[-1])\n"
+                            "assert args in (['kubectl', 'get', 'nodes,pods,daemonsets,deployments,statefulsets,leases', '--all-namespaces', '-o', 'json'], ['kubectl', 'version', '-o', 'json']), args\n"
+                            "with pathlib.Path(__file__).with_suffix('.calls').open('a') as f: f.write(args[1] + '\\n')\n"
+                            "print('{}')\n")
+            original = ROOT / 'playbooks/tasks/maintenance-snapshot.yml'
+            legacy = yaml.safe_load(original.read_text())
+            for task in legacy:
+                task['vars']['ansible_remote_tmp'] = "{{ lookup('ansible.builtin.env', 'TMPDIR') }}"
+            (work / 'legacy.yml').write_text(yaml.safe_dump(legacy))
+            (work / 'ansible.cfg').write_text('[defaults]\nforks=1\nretry_files_enabled=False\n[connection]\npipelining=False\n')
+            env = dict(os.environ, ANSIBLE_CONFIG=str(work / 'ansible.cfg'))
+            for key in ('TMPDIR', 'ANSIBLE_LOCAL_TEMP', 'ANSIBLE_REMOTE_TEMP'):
+                env.pop(key, None)
+            probes = [{'name': 'Staging probe: ' + t['name'],
+                       'ansible.builtin.command': {'argv': [PYTHON, '-B', '-c', 'print("staging-ok")']},
+                       'delegate_to': 'localhost', 'become': False,
+                       'vars': t['vars'], 'changed_when': False} for t in delegated_tasks()]
+            for old in (True, False):
+                tasks = [{'ansible.builtin.include_tasks': str(work / 'legacy.yml' if old else original)}]
+                if not old:
+                    tasks += probes
+                play = {'hosts': 'fixture', 'gather_facts': False, 'become': False,
+                        'vars': {'maintenance_ssh_argv': [PYTHON, '-B', str(mock)],
+                                 'maintenance_kubectl_argv': ['kubectl'],
+                                 'ansible_remote_tmp': '/var/lib/ansible-maintenance/tmp'}, 'tasks': tasks}
+                (work / 'play.yml').write_text(yaml.safe_dump([play]))
+                result = subprocess.run([PYTHON, '-B', '-m', 'ansible.cli.playbook', '-i', 'fixture,', str(work / 'play.yml')],
+                                        cwd=work, env=env, text=True, capture_output=True, timeout=90)
+                output = result.stdout + result.stderr
+                (Path(os.environ['TMPDIR']) / ('staging-old.log' if old else 'staging-fixed.log')).write_text(output)
+                if old:
+                    self.assertNotEqual(result.returncode, 0, output)
+                    self.assertIn('mkdir', output)
+                    self.assertIn('Failed to create temporary directory', output)
+                    self.assertFalse(mock.with_suffix('.calls').exists(), output)
+                else:
+                    self.assertEqual(result.returncode, 0, output)
+                    self.assertEqual(mock.with_suffix('.calls').read_text().splitlines(), ['get', 'version'])
+                    self.assertEqual(len(probes), len(delegated_tasks()))
+
+    def run_emptydir_policy_fixture(self, explicit_false=False):
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
+            work = Path(directory)
+            play = yaml.safe_load((ROOT / 'playbooks/kubernetes-nodes-update-v2.yml').read_text())[0]
+            # Execute only the real first task, with the production defaults intact.
+            play.update(hosts='localhost', connection='local', become=False,
+                        tasks=play['tasks'][:1])
+            (work / 'play.yml').write_text(yaml.safe_dump([play]))
+            (work / 'ansible.cfg').write_text('[defaults]\nforks=1\nretry_files_enabled=False\n')
+            env = os.environ | {'ANSIBLE_CONFIG': str(work / 'ansible.cfg'),
+                                'ANSIBLE_LOCAL_TEMP': str(work / 'local')}
+            argv = [PYTHON, '-B', '-m', 'ansible.cli.playbook', '-i', 'localhost,', str(work / 'play.yml')]
+            if explicit_false:
+                argv += ['-e', '{"maintenance_delete_emptydir_data": false}']
+            result = subprocess.run(argv, cwd=work, env=env, text=True, capture_output=True, timeout=60)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 2 if explicit_false else 0, output)
+            self.assertIn(play['tasks'][0]['name'], output)
+            if explicit_false:
+                self.assertIn(play['tasks'][0]['ansible.builtin.assert']['fail_msg'], output)
+            else:
+                self.assertIn('All assertions passed', output)
+
+    def test_emptydir_policy_default_passes_first_task(self):
+        self.run_emptydir_policy_fixture()
+
+    def test_emptydir_policy_explicit_false_rejects_first_task(self):
+        self.run_emptydir_policy_fixture(explicit_false=True)
+
     def test_containerd_final_status_changed_when(self):
         from ansible.parsing.dataloader import DataLoader
         from ansible.template import Templar
@@ -441,7 +577,8 @@ class AnsibleRuntimeTests(unittest.TestCase):
         variables['maintenance_kubectl_argv'] = ['doas', 'kubectl', '--kubeconfig=/path with spaces/$HOME']
         templar = Templar(loader=loader, variables=variables)
         snapshot = loader.load_from_file(str(ROOT / 'playbooks/tasks/maintenance-snapshot.yml'), trusted_as_template=True)
-        tasks = snapshot + [t for t in play['tasks'][-1]['block']
+        node_tasks = loader.load_from_file(str(ROOT / 'playbooks/tasks/maintenance-node.yml'), trusted_as_template=True)
+        tasks = snapshot + [t for t in node_tasks[-1]['block']
                             if 'ansible.builtin.command' in t and 'timeout' in str(t['ansible.builtin.command'])]
         for task in tasks:
             command = task['ansible.builtin.command']
@@ -459,7 +596,7 @@ class AnsibleRuntimeTests(unittest.TestCase):
             (work / 'files').mkdir()
             (work / 'files/maintenance_health.py').write_text((ROOT / 'playbooks/files/maintenance_health.py').read_text())
             returns = yaml.safe_load((ROOT / 'playbooks/tasks/maintenance-return.yml').read_text())
-            returns[0]['block'][-1]['ansible.builtin.pause']['seconds'] = 0
+            returns[0]['block'][-2]['ansible.builtin.pause']['seconds'] = 0
             (work / 'maintenance-return.yml').write_text(yaml.safe_dump(returns))
             (work / 'maintenance-snapshot.yml').write_text((ROOT / 'playbooks/tasks/maintenance-snapshot.yml').read_text())
             data = fixture()
@@ -483,6 +620,8 @@ assert argv[:4] == ['doas', 'kubectl', '--kubeconfig=/fixture path/quote\";$(fal
 if n == 0:
     sys.exit('fixture: control plane unreachable')
 data = json.loads((work / 'input.json').read_text())
+if n == 2:
+    data['resources']['items'][0]['status']['nodeInfo']['bootID'] = 'old'
 print(json.dumps(data['resources'] if argv[4] == 'get' else data['version']))
 """)
             play = yaml.safe_load((ROOT / 'playbooks/kubernetes-nodes-update-v2.yml').read_text())[0]
@@ -495,7 +634,7 @@ print(json.dumps(data['resources'] if argv[4] == 'get' else data['version']))
                 'maintenance_reboot': True,
                 'maintenance_after': (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=5)).isoformat()}
             tasks = [
-                {'ansible.builtin.include_tasks': 'maintenance-return.yml', 'loop': '{{ range(4) | list }}',
+                {'ansible.builtin.include_tasks': 'maintenance-return.yml',
                  'when': 'not maintenance_return_success | bool'},
                 {'ansible.builtin.assert': {'that': ['maintenance_return_success | bool', "maintenance_node == 'kube-controller'", "maintenance_baseline.boot == 'old'"]}}]
             if not observing:
@@ -506,7 +645,16 @@ print(json.dumps(data['resources'] if argv[4] == 'get' else data['version']))
             result = subprocess.run([PYTHON, '-B', '-m', 'ansible.cli.playbook', '-i', 'kube,', str(work / 'play.yml')],
                                     cwd=work, env=env, text=True, capture_output=True, timeout=60)
             self.assertEqual(result.returncode, 0 if observing else 2, result.stdout + result.stderr)
-            self.assertEqual((work / 'calls').read_text(), '4' if observing else '1')
+            self.assertEqual((work / 'calls').read_text(), '6' if observing else '1')
+            if observing:
+                output = result.stdout + result.stderr
+                self.assertIn('Observation 1 rejected:', output)
+                self.assertIn('fixture: control plane unreachable', output)
+                self.assertIn('Observation 2 rejected:', output)
+                self.assertIn('Waiting for actual kured boot-ID change', output)
+                self.assertIn('Healthy return observed', output)
+                self.assertEqual(output.count('Pausing for'), 2)
+                self.assertEqual(output.count('included: ' + str(work / 'maintenance-return.yml')), 3)
 
     def test_unreachable_then_return_and_skipped_includes(self):
         self.run_fixture(True)

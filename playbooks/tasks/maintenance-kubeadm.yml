@@ -1,0 +1,137 @@
+---
+- name: Back up control plane before any control-plane package change
+  when: maintenance_node_plan.control_plane and (maintenance_plan.upgrade_api or maintenance_node_plan.reconcile or maintenance_node_plan.packages | length > 0)
+  block:
+    - name: Create unique private backup directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: /var/lib/ansible-maintenance
+        prefix: control-plane-backup-
+      register: maintenance_backup
+
+    - name: Archive Kubernetes configuration and certificates
+      ansible.builtin.command:
+        argv: [tar, -C, /, -czf, '{{ maintenance_backup.path }}/etc-kubernetes.tar.gz', etc/kubernetes]
+
+    - name: Read actual etcd manifest
+      ansible.builtin.slurp:
+        src: /etc/kubernetes/manifests/etcd.yaml
+      register: maintenance_etcd_manifest
+
+    - name: Discover etcd data mount and host path
+      ansible.builtin.set_fact:
+        maintenance_etcd_mount: '{{ (maintenance_etcd_spec.containers[0].volumeMounts | selectattr("name", "equalto", "etcd-data") | first).mountPath }}'
+        maintenance_etcd_host: '{{ (maintenance_etcd_spec.volumes | selectattr("name", "equalto", "etcd-data") | first).hostPath.path }}'
+      vars:
+        maintenance_etcd_spec: '{{ (maintenance_etcd_manifest.content | b64decode | from_yaml).spec }}'
+
+    - name: Find running etcd container
+      ansible.builtin.command:
+        argv: [crictl, --runtime-endpoint, 'unix:///run/containerd/containerd.sock', ps, --name, etcd, -q]
+      register: maintenance_etcd_container
+      changed_when: false
+
+    - name: Require unique etcd container and absolute disk data paths
+      ansible.builtin.assert:
+        that:
+          - maintenance_etcd_container.stdout_lines | length == 1
+          - maintenance_etcd_host.startswith('/var/lib/')
+          - maintenance_etcd_mount.startswith('/var/lib/')
+
+    - name: Save consistent etcd snapshot
+      ansible.builtin.command:
+        argv: [timeout, 180s, crictl, --runtime-endpoint, 'unix:///run/containerd/containerd.sock', exec, '{{ maintenance_etcd_container.stdout | trim }}', etcdctl, '--endpoints=https://127.0.0.1:2379', '--cacert=/etc/kubernetes/pki/etcd/ca.crt', '--cert=/etc/kubernetes/pki/etcd/server.crt', '--key=/etc/kubernetes/pki/etcd/server.key', snapshot, save, '{{ maintenance_etcd_mount }}/{{ maintenance_backup.path | basename }}.db']
+
+    - name: Validate snapshot with etcdutl before mutation
+      ansible.builtin.command:
+        argv: [timeout, 60s, crictl, --runtime-endpoint, 'unix:///run/containerd/containerd.sock', exec, '{{ maintenance_etcd_container.stdout | trim }}', etcdutl, snapshot, status, '{{ maintenance_etcd_mount }}/{{ maintenance_backup.path | basename }}.db']
+      changed_when: false
+
+    - name: Retain validated snapshot beside configuration backup
+      ansible.builtin.command:
+        argv: [mv, '{{ maintenance_etcd_host }}/{{ maintenance_backup.path | basename }}.db', '{{ maintenance_backup.path }}/etcd.snapshot.db']
+
+    - name: Hash retained recovery artifacts
+      ansible.builtin.command:
+        argv: [sha256sum, '{{ maintenance_backup.path }}/etc-kubernetes.tar.gz', '{{ maintenance_backup.path }}/etcd.snapshot.db']
+      register: maintenance_backup_hashes
+      changed_when: false
+
+    - name: Retain backup checksums
+      ansible.builtin.copy:
+        dest: '{{ maintenance_backup.path }}/SHA256SUMS'
+        content: '{{ maintenance_backup_hashes.stdout }}\n'
+        mode: '0600'
+
+- name: Install only the pinned kubeadm archive first
+  ansible.builtin.script:
+    cmd: 'files/maintenance_packages.py kubeadm {{ maintenance_stage.path | quote }}'
+    executable: python3
+  register: maintenance_kubeadm_install
+  changed_when: (maintenance_kubeadm_install.stdout | from_json).changed
+
+- name: Verify installed kubeadm target binary
+  ansible.builtin.command:
+    argv: [kubeadm, version, -o, short]
+  register: maintenance_kubeadm_version
+  changed_when: false
+  failed_when: maintenance_kubeadm_version.rc != 0 or maintenance_kubeadm_version.stdout | trim != maintenance_plan.target
+
+- name: Apply supported control-plane transition
+  ansible.builtin.command:
+    argv: [timeout, 900s, kubeadm, upgrade, apply, '{{ maintenance_plan.target }}', --yes]
+  when: maintenance_node_plan.apply
+
+- name: Persist successful control-plane apply completion
+  ansible.builtin.copy:
+    dest: /var/lib/ansible-maintenance/pending.json
+    content: '{{ maintenance_pending_work | combine({"apply_complete": true}) | to_nice_json }}'
+    mode: '0600'
+  when: maintenance_node_plan.apply
+
+- name: Reconcile node-local kubeadm state including API-at-target resume
+  ansible.builtin.command:
+    argv: [timeout, 600s, kubeadm, upgrade, node]
+  when: maintenance_node_plan.reconcile and not maintenance_node_plan.apply
+
+- name: Require target API before kubelet archive installation
+  ansible.builtin.command:
+    argv: "{{ ['timeout', '30s'] + maintenance_ssh_argv + [(maintenance_kubectl_argv + ['version', '-o', 'json']) | map('quote') | join(' ')] }}"
+    expand_argument_vars: false
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: '{{ ansible_playbook_python }}'
+    ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'HOME') + '/.ansible/tmp' }}"
+  become: false
+  register: maintenance_target_api
+  changed_when: false
+  until: maintenance_target_api.rc == 0 and (maintenance_target_api.stdout | from_json).serverVersion.gitVersion == maintenance_plan.target
+  retries: 30
+  delay: 5
+
+- name: Require target API readiness
+  ansible.builtin.command:
+    argv: "{{ ['timeout', '30s'] + maintenance_ssh_argv + [(maintenance_kubectl_argv + ['get', '--raw=/readyz']) | map('quote') | join(' ')] }}"
+    expand_argument_vars: false
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: '{{ ansible_playbook_python }}'
+    ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'HOME') + '/.ansible/tmp' }}"
+  become: false
+  changed_when: false
+
+- name: Install all remaining pinned archives after the target API
+  ansible.builtin.script:
+    cmd: 'files/maintenance_packages.py rest {{ maintenance_stage.path | quote }}'
+    executable: python3
+  register: maintenance_rest_install
+  changed_when: (maintenance_rest_install.stdout | from_json).changed
+
+- name: Restart reconciled or upgraded kubelet only after target API
+  ansible.builtin.systemd_service:
+    name: kubelet
+    daemon_reload: true
+    state: restarted
+  when: maintenance_node_plan.reconcile or 'kubelet' in maintenance_node_plan.packages

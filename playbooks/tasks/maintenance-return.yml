@@ -1,33 +1,65 @@
 ---
 - name: Observe only until a successful return
-  when: not maintenance_return_success | bool
   block:
-    - name: Refresh post-maintenance cluster state
-      ansible.builtin.include_tasks: maintenance-snapshot.yml
-      vars:
-        maintenance_observing: true
-
-    - name: Verify return against the original node identity
-      ansible.builtin.command:
-        argv: ['{{ ansible_playbook_python }}', -B, -c, "{{ lookup('ansible.builtin.file', playbook_dir + '/files/maintenance_health.py') }}"]
-        stdin: "{{ {'resources': maintenance_resources.stdout | from_json, 'version': maintenance_api.stdout | from_json, 'node': maintenance_node, 'baseline': maintenance_baseline, 'after': maintenance_after, 'reboot': maintenance_reboot} | to_json }}"
-      delegate_to: localhost
-      vars:
-        ansible_connection: local
-        ansible_python_interpreter: "{{ ansible_playbook_python }}"
-        ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'TMPDIR') }}"
-      become: false
-      register: maintenance_return
-      changed_when: false
-      failed_when: false
-      when: maintenance_resources.rc == 0 and maintenance_api.rc == 0
-
-    - name: Retain successful executed observation across skipped includes
+    - name: Count bounded health observations
       ansible.builtin.set_fact:
-        maintenance_return_success: "{{ maintenance_return.rc == 0 }}"
-      when: not (maintenance_return.skipped | default(false))
+        maintenance_return_attempt: "{{ (maintenance_return_attempt | default(0) | int) + 1 }}"
+
+    - name: Observe and retain the current rejection
+      block:
+        - name: Refresh post-maintenance cluster state
+          ansible.builtin.include_tasks: maintenance-snapshot.yml
+          vars:
+            maintenance_observing: true
+
+        - name: Reject unsuccessful cluster reads
+          ansible.builtin.assert:
+            that:
+              - maintenance_resources.rc == 0
+              - maintenance_api.rc == 0
+            quiet: true
+            fail_msg: >-
+              Cluster read failed: resources rc={{ maintenance_resources.rc }}
+              {{ maintenance_resources.stderr | default('') | trim }};
+              version rc={{ maintenance_api.rc }} {{ maintenance_api.stderr | default('') | trim }}
+
+        - name: Verify return against the original node identity
+          ansible.builtin.command:
+            argv: ['{{ ansible_playbook_python }}', -B, -c, "{{ lookup('ansible.builtin.file', playbook_dir + '/files/maintenance_health.py') }}"]
+            stdin: "{{ {'resources': maintenance_resources.stdout | from_json, 'version': maintenance_api.stdout | from_json, 'node': maintenance_node, 'baseline': maintenance_baseline, 'after': maintenance_after, 'reboot': maintenance_reboot} | to_json }}"
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+            ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'HOME') + '/.ansible/tmp' }}"
+          become: false
+          register: maintenance_return
+          changed_when: false
+          no_log: true
+
+        - name: Retain successful executed observation
+          ansible.builtin.set_fact:
+            maintenance_return_success: true
+
+      rescue:
+        - name: Retain current observation failure
+          ansible.builtin.set_fact:
+            maintenance_return_reason: "{{ ansible_failed_result.stderr | default('', true) | trim or ansible_failed_result.msg | default('Observation failed without diagnostic', true) }}"
+
+        - name: Report unsuccessful observation
+          ansible.builtin.debug:
+            msg: "Observation {{ maintenance_return_attempt }} rejected: {{ maintenance_return_reason }}"
+
+    - name: Report healthy success
+      ansible.builtin.debug:
+        msg: Healthy return observed
+      when: maintenance_return_success | bool
 
     - name: Wait between bounded health observations
       ansible.builtin.pause:
         seconds: 15
-      when: not maintenance_return_success | bool
+      when: not maintenance_return_success | bool and maintenance_return_attempt | int < 60
+
+    - name: Retry only an unsuccessful observation within the deadline
+      ansible.builtin.include_tasks: maintenance-return.yml
+      when: not maintenance_return_success | bool and maintenance_return_attempt | int < 60
