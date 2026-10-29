@@ -2,13 +2,13 @@
 import json
 import base64
 import hashlib
-import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'playbooks/files'))
 import maintenance_packages as packages
@@ -99,6 +99,7 @@ class PackageTests(unittest.TestCase):
             with self.subTest(devel=devel), tempfile.TemporaryDirectory() as temp:
                 work=Path(temp)
                 built=[]
+                verified=[]
                 def run(argv,cwd=None,**kwargs):
                     if argv[:2]==['paru','-Qua']:
                         return 'sample 1-1 -> '+('latest-commit' if devel else '2-1')
@@ -107,7 +108,9 @@ class PackageTests(unittest.TestCase):
                         (cwd/'sample/PKGBUILD').write_text('pkgname=sample\npkgver=2')
                         return ''
                     if '--printsrcinfo' in argv: return 'pkgbase = sample\n\tpkgver = 2'
-                    if '--verifysource' in argv: return ''
+                    if '--verifysource' in argv:
+                        verified.append(argv)
+                        return ''
                     if '--packagelist' in argv: return str(cwd/'sample.pkg.tar.zst')
                     if argv[0]=='vercmp': return '1'
                     self.fail('Unexpected command: '+repr(argv))
@@ -121,6 +124,7 @@ class PackageTests(unittest.TestCase):
                         self.assertEqual(result['archives'][0]['version'],'2-1')
                         self.assertEqual(result['archives'][0]['sha256'],hashlib.sha256(b'compiled archive').hexdigest())
                 self.assertEqual(len(built),2 if devel else 1)
+                self.assertEqual(verified, [['makepkg', '--verifysource', '--noconfirm']] * 2)
 
     def test_empty_query_does_not_hide_network_failure(self):
         result = subprocess.CompletedProcess(['paru'], 1, '', 'AUR connection failed')
@@ -245,33 +249,84 @@ class PackageTests(unittest.TestCase):
         self.assertTrue(packages.memory_safe('MemTotal: 8000000 kB\nMemAvailable: 2097152 kB'))
         self.assertFalse(packages.memory_safe('MemTotal: 64000000 kB\nMemAvailable: 6399999 kB'))
 
-    def test_real_build_process_group_is_killed_at_threshold(self):
+    def test_build_argv_and_supervision_preserve_verification(self):
         with tempfile.TemporaryDirectory() as temp:
             work = Path(temp)
-            script = work / 'makepkg'
-            script.write_text('#!/bin/sh\nsleep 30\n')
-            script.chmod(0o700)
-            spawned = []
-            real = subprocess.Popen
-            def popen(*args, **kwargs):
-                process = real(*args, **kwargs)
-                spawned.append(process)
-                return process
-            with patch.dict(os.environ, {'PATH': str(work) + ':' + os.environ['PATH']}), patch.object(packages, 'memory_safe', side_effect=[True, False]), patch.object(packages.subprocess, 'Popen', side_effect=popen):
-                with self.assertRaisesRegex(ValueError, 'memory reserve'):
-                    packages.build(work)
-            self.assertEqual(len(spawned), 1)
-            self.assertEqual(spawned[0].poll(), -9)
+            process = Mock(returncode=0)
+            process.poll.side_effect = [None, 0, 0]
+            with patch.object(packages.subprocess, 'Popen', return_value=process) as popen, patch.object(packages, 'memory_safe', return_value=True), patch.object(packages.time, 'monotonic', side_effect=[100, 101]), patch.object(packages.time, 'sleep') as sleep, patch.object(packages.os, 'killpg') as kill:
+                packages.build(work)
+            self.assertEqual(popen.call_args.args[0], ['makepkg', '--noconfirm', '--force', '--nocheck'])
+            options = popen.call_args.kwargs
+            self.assertEqual(options['cwd'], work)
+            self.assertEqual(options['process_group'], 0)
+            self.assertEqual(options['stderr'], subprocess.STDOUT)
+            self.assertEqual(options['stdout'].name, str(work / 'maintenance-build.log'))
+            self.assertEqual(options['env']['MAKEFLAGS'], '-j2')
+            self.assertEqual(options['env']['CARGO_BUILD_JOBS'], '2')
+            sleep.assert_called_once_with(0.5)
+            kill.assert_not_called()
+            process.wait.assert_not_called()
 
-    def test_failed_build_is_not_an_archive(self):
-        with tempfile.TemporaryDirectory() as temp:
-            work = Path(temp)
-            script = work / 'makepkg'
-            script.write_text('#!/bin/sh\nexit 7\n')
-            script.chmod(0o700)
-            with patch.dict(os.environ, {'PATH': str(work) + ':' + os.environ['PATH']}), patch.object(packages, 'memory_safe', return_value=True):
-                with self.assertRaisesRegex(ValueError, 'AUR build failed'):
-                    packages.build(work)
+    def test_build_watchdog_diagnostics_and_process_group_cleanup(self):
+        for reason, memory, times in (
+                ('two-hour deadline', [True], [100, 7300]),
+                ('memory reserve', [True, False], [100, 101])):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as temp:
+                work = Path(temp) / 'sofka-git'
+                work.mkdir()
+                process = Mock(pid=1234)
+                process.poll.return_value = None
+                def popen(*args, **kwargs):
+                    kwargs['stdout'].write('compiler diagnostic\n')
+                    process.wait.side_effect = lambda: kwargs['stdout'].write('cleanup finished\n')
+                    return process
+                with patch.object(packages.subprocess, 'Popen', side_effect=popen), patch.object(packages, 'memory_safe', side_effect=memory), patch.object(packages.time, 'monotonic', side_effect=times), patch.object(packages.time, 'sleep') as sleep, patch.object(packages.os, 'killpg') as kill:
+                    with self.assertRaisesRegex(ValueError, reason) as caught:
+                        packages.build(work)
+                message = str(caught.exception)
+                for expected in ('sofka-git', str(work), str(work / 'maintenance-build.log'), 'compiler diagnostic', 'cleanup finished'):
+                    self.assertIn(expected, message)
+                kill.assert_called_once_with(1234, signal.SIGKILL)
+                process.wait.assert_called_once_with()
+                sleep.assert_not_called()
+
+    def test_build_preflight_and_launch_errors_have_context(self):
+        for safe, reason in ((False, 'Insufficient available memory'), (True, 'cannot launch makepkg')):
+            with self.subTest(safe=safe), tempfile.TemporaryDirectory() as temp:
+                work = Path(temp)
+                with patch.object(packages, 'memory_safe', return_value=safe), patch.object(packages.subprocess, 'Popen', side_effect=OSError('cannot launch makepkg')) as popen:
+                    with self.assertRaisesRegex(ValueError, reason) as caught:
+                        packages.build(work)
+                self.assertIn(str(work), str(caught.exception))
+                self.assertIn('maintenance-build.log', str(caught.exception))
+                self.assertEqual(popen.call_count, int(safe))
+
+    def test_failed_build_includes_bounded_log_tail(self):
+        for output in ('omitted\n' + 'compiler detail\n' * 50 + 'final failure\n',
+                       'omitted\n' + 'x' * 20000 + '\nfinal failure\n'):
+            with self.subTest(size=len(output)), tempfile.TemporaryDirectory() as temp:
+                work = Path(temp)
+                process = Mock(returncode=7)
+                process.poll.return_value = 7
+                def popen(*args, **kwargs):
+                    kwargs['stdout'].write(output)
+                    return process
+                with patch.object(packages.subprocess, 'Popen', side_effect=popen), patch.object(packages, 'memory_safe', return_value=True), patch.object(packages.os, 'killpg') as kill:
+                    with self.assertRaisesRegex(ValueError, 'AUR build failed') as caught:
+                        packages.build(work)
+                message = str(caught.exception)
+                self.assertIn(str(work), message)
+                self.assertIn('exit 7', message)
+                self.assertIn('maintenance-build.log', message)
+                tail = message.split('Last up to 40 lines / 8192 bytes:\n', 1)[1]
+                self.assertIn('final failure', tail)
+                self.assertNotIn('omitted', tail)
+                self.assertLessEqual(len(tail.encode()), 8192)
+                self.assertLessEqual(len(tail.splitlines()), 40)
+                self.assertEqual((work / 'maintenance-build.log').read_text(), output)
+                kill.assert_not_called()
+                process.wait.assert_not_called()
 
 
 if __name__ == '__main__':

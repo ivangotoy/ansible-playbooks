@@ -134,25 +134,41 @@ def memory_safe(meminfo, minimum=2 * 1024 * 1024):
 
 
 def build(directory):
-    require(memory_safe(Path('/proc/meminfo').read_text()), 'Insufficient available memory before AUR build')
     # Foreground supervised process group: abort the compiler children as well
     # as makepkg, before available memory crosses the host safety reserve.
-    with (directory / 'maintenance-build.log').open('w') as log:
-        process = subprocess.Popen(['makepkg', '--noconfirm', '--force'], cwd=directory,
-                                   stdout=log, stderr=subprocess.STDOUT, process_group=0,
-                                   env=os.environ | {'MAKEFLAGS': '-j2', 'CARGO_BUILD_JOBS': '2', 'LC_ALL': 'C'})
-        deadline = time.monotonic() + 7200
+    log_path = directory / 'maintenance-build.log'
+    try:
+        with log_path.open('w') as log:
+            require(memory_safe(Path('/proc/meminfo').read_text()), 'Insufficient available memory before AUR build')
+            # Maintenance produces installable archives, without running the
+            # upstream application check() suite. Source verification remains on.
+            process = subprocess.Popen(['makepkg', '--noconfirm', '--force', '--nocheck'], cwd=directory,
+                                       stdout=log, stderr=subprocess.STDOUT, process_group=0,
+                                       env=os.environ | {'MAKEFLAGS': '-j2', 'CARGO_BUILD_JOBS': '2', 'LC_ALL': 'C'})
+            deadline = time.monotonic() + 7200
+            try:
+                while process.poll() is None:
+                    require(time.monotonic() < deadline, 'AUR build exceeded two-hour deadline')
+                    require(memory_safe(Path('/proc/meminfo').read_text()), 'AUR build aborted at memory reserve')
+                    time.sleep(0.5)
+                require(process.returncode == 0,
+                        'AUR build failed (exit ' + str(process.returncode) +
+                        '); missing/new/cyclic dependencies must be provisioned separately')
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+    except (ValueError, OSError) as error:
+        # Bound both I/O and diagnostic size even for very large compiler logs.
         try:
-            while process.poll() is None:
-                require(time.monotonic() < deadline, 'AUR build exceeded two-hour deadline')
-                require(memory_safe(Path('/proc/meminfo').read_text()), 'AUR build aborted at memory reserve')
-                time.sleep(0.5)
-            require(process.returncode == 0,
-                    'AUR build failed; missing/new/cyclic dependencies must be provisioned separately. See ' + str(log.name))
-        finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            with log_path.open('rb') as log:
+                log.seek(0, os.SEEK_END)
+                log.seek(max(0, log.tell() - 8192))
+                tail = '\n'.join(log.read(8192).decode('utf-8', errors='replace').splitlines()[-40:])
+        except OSError:
+            tail = '(build log unavailable)'
+        raise ValueError(f'AUR package {directory.name} in {directory}: {error}\n'
+                         f'Build log: {log_path}\nLast up to 40 lines / 8192 bytes:\n{tail}') from error
 
 
 def cached_paru_archive(directory, name, target, recipe, clone_dir):
