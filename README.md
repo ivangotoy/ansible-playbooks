@@ -11,7 +11,6 @@ Production-grade Ansible playbooks for Linux infrastructure management — Kuber
 |---|---|---|
 | `cluster-perf-tuning.yml` | Kubernetes nodes | CPU governor, THP, network buffers, containerd tuning |
 | `kubernetes-nodes-update-v2.yml` | Kubernetes nodes | Guarded OS maintenance via paru and kured |
-| `kubernetes-nodes-update.yml` | Kubernetes nodes | Parallel package upgrades via paru |
 | `refresh-mirrors.yml` | Kubernetes nodes | CachyOS mirror refresh via cachyos-rate-mirrors |
 | `update-upgrade.yml` | Mixed (Debian/Arch) | OS-aware package upgrades with async execution |
 | `update-jenkins-plugins.yml` | Jenkins host | Automated Jenkins plugin updates via API |
@@ -125,12 +124,12 @@ vault_jenkins_api_token: "your-token-here"
 Sensitive values (API tokens, passwords) are never stored in plaintext. Use Ansible Vault:
 ```bash
 ansible-vault create vars/vault.yml
-ansible-playbook update-jenkins-plugins.yml --ask-vault-pass
+ansible-playbook playbooks/update-jenkins-plugins.yml -e @vars/vault.yml --ask-vault-pass
 ```
 
 ## Linting
 ```bash
-ansible-lint *.yml
+ansible-lint playbooks/
 ```
 
 ## Environment
@@ -138,6 +137,6 @@ ansible-lint *.yml
 - **Kubernetes nodes:** CachyOS (Arch-based), managed with `paru`
 - **Web servers:** Mixed Debian/Arch
 - **Privilege escalation:** `doas`
-- **SSH:** Ed25519 keys, ControlMaster persistent connections Sonnet 4.6
+- **SSH:** Ed25519 keys, ControlMaster persistent connections
 
 The health guard also supports read-only standalone preflight, without maintenance execution. Pipe one JSON object with `resources` (the resource List from the read command), `version` (kubectl version JSON), and `node` (`kube-controller` or a worker name) into `/home/ivan/ansible-learning-new/bin/python -B playbooks/files/maintenance_health.py`. Do not include `baseline`, `after` or `reboot` for initial preflight. It emits the original boot/version/lease on success and exits nonzero on unsafe configuration or unhealthy state. Parent live preflight remains separate from these offline checks.
