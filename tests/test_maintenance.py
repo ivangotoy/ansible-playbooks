@@ -422,6 +422,28 @@ class PlaybookTests(unittest.TestCase):
         self.assertEqual(gate['block'][-1]['when'], 'not maintenance_return_success | bool and maintenance_return_attempt | int < 300')
         self.assertIn('ansible.builtin.assert', play['tasks'][-1]['block'][play['tasks'][-1]['block'].index(observation) + 1])
 
+    def test_control_plane_backup_checksums_verify(self):
+        backup = yaml.safe_load((ROOT / 'playbooks/tasks/maintenance-kubeadm.yml').read_text())[0]['block']
+        tasks = [t for t in backup if t['name'] in ('Hash retained recovery artifacts', 'Retain backup checksums')]
+        self.assertEqual(len(tasks), 2)
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            for name in ('etc-kubernetes.tar.gz', 'etcd.snapshot.db'):
+                (work / name).write_text(name + '\n')
+            play = [{'hosts': 'localhost', 'gather_facts': False, 'become': False,
+                     'vars': {'ansible_connection': 'local', 'ansible_python_interpreter': PYTHON,
+                              'maintenance_backup': {'path': str(work)}},
+                     'tasks': tasks}]
+            (work / 'play.yml').write_text(yaml.safe_dump(play))
+            (work / 'ansible.cfg').write_text('[defaults]\nretry_files_enabled=False\n')
+            env = os.environ | {'ANSIBLE_CONFIG': str(work / 'ansible.cfg'), 'ANSIBLE_LOCAL_TEMP': str(work / 'local')}
+            result = subprocess.run([PYTHON, '-B', '-m', 'ansible.cli.playbook', '-i', 'localhost,', str(work / 'play.yml')],
+                                    cwd=work, env=env, text=True, capture_output=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((work / 'SHA256SUMS').read_text().endswith('etcd.snapshot.db\n'))
+            check = subprocess.run(['sha256sum', '-c', 'SHA256SUMS'], cwd=work, text=True, capture_output=True)
+            self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+
     def test_debian_polling_orders_cache_before_upgrade(self):
         tasks = yaml.safe_load((ROOT / 'playbooks/update-upgrade.yml').read_text())[1]['tasks']
         self.assertEqual(len(tasks), 2)

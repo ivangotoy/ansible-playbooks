@@ -60,7 +60,7 @@
     - name: Retain backup checksums
       ansible.builtin.copy:
         dest: '{{ maintenance_backup.path }}/SHA256SUMS'
-        content: '{{ maintenance_backup_hashes.stdout }}\n'
+        content: "{{ maintenance_backup_hashes.stdout }}\n"
         mode: '0600'
 
 - name: Install only the pinned kubeadm archive first
