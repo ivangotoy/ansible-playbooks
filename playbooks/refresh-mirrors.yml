@@ -16,3 +16,12 @@
       ansible.builtin.debug:
         msg: "{{ mirror_result.stdout_lines }}"
       when: mirror_result.stdout != ""
+
+    # cachyos-rate-mirrors always inserts this mirror above the rated Arch
+    # list; from these nodes it serves about 0.1 MB/s and stalls core, extra
+    # and multilib downloads.
+    - name: Remove the forced slow Arch mirror from the rated list
+      ansible.builtin.lineinfile:
+        path: /etc/pacman.d/mirrorlist
+        regexp: '^Server = https://mirror\.zyner\.org/'
+        state: absent
