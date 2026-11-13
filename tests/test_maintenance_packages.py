@@ -15,6 +15,11 @@ import maintenance_packages as packages
 
 
 class PackageTests(unittest.TestCase):
+    def test_run_tolerates_non_utf8_command_output(self):
+        output = packages.run([sys.executable, '-c',
+                               "import sys; sys.stdout.buffer.write(b'Good signature from B\\xf6decker')"])
+        self.assertEqual(output, 'Good signature from B\ufffddecker')
+
     def test_seal_requires_exact_repository_candidate_or_installed_version(self):
         for case in ('installed', 'repo', 'ignored', 'wrong-version', 'aur', 'wrong-name'):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as temp:

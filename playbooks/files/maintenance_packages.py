@@ -28,7 +28,9 @@ def require(ok, message):
 
 
 def run(argv, cwd=None, allowed=(0,), timeout=1800):
-    result = subprocess.run(argv, cwd=cwd, text=True, capture_output=True,
+    # LC_ALL=C makes gpg print non-ASCII signer names in Latin-1, so output
+    # is not always valid UTF-8; verdicts come from the return code.
+    result = subprocess.run(argv, cwd=cwd, encoding='utf-8', errors='replace', capture_output=True,
                             timeout=timeout, env=os.environ | {'LC_ALL': 'C', 'LANG': 'C'})
     require(result.returncode in allowed,
             'Command failed: ' + ' '.join(map(str, argv)) + '\n' + result.stdout + result.stderr)
