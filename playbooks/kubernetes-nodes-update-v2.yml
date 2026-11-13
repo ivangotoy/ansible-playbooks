@@ -1,262 +1,310 @@
-- name: Prepare all nodes and validate the complete maintenance transition
+---
+# Variables: group_vars/kubernetes.yml
+
+- name: Download pending upgrades on every node
   hosts: kubernetes
   become: true
   gather_facts: false
   any_errors_fatal: true
-  vars: &id003
-    aur_user: ansible
-    maintenance_node: '{{ ''kube-controller'' if inventory_hostname == ''kube'' else inventory_hostname }}'
-    maintenance_ssh_argv:
-    - ssh
-    - -o
-    - BatchMode=yes
-    - -o
-    - ConnectTimeout=10
-    - -o
-    - ServerAliveInterval=5
-    - -o
-    - ServerAliveCountMax=2
-    - -i
-    - /home/ivan/.ssh/ansible
-    - ansible@kube
-    maintenance_kubectl_argv:
-    - doas
-    - kubectl
-    - --kubeconfig=/etc/kubernetes/admin.conf
-    - --request-timeout=10s
-    maintenance_delete_emptydir_data: true
-    ansible_remote_tmp: /var/lib/ansible-maintenance/tmp
   tasks:
-  - name: Require emptyDir policy compatibility with native kured drain
-    ansible.builtin.assert:
-      that: maintenance_delete_emptydir_data | bool
-      fail_msg: maintenance_delete_emptydir_data=false is unsupported because native kured drain cannot guarantee emptyDir
-        data preservation. A preservation requirement needs a separately reviewed kured policy.
-  - name: Require full inventory before preparation
-    ansible.builtin.assert:
-      that: ansible_play_hosts_all | sort == groups["kubernetes"] | sort
-      fail_msg: Do not limit this maintenance play; all nodes must be prepared and gated.
-  - name: Discover cluster health and kured configuration
-    ansible.builtin.include_tasks: tasks/maintenance-snapshot.yml
-    vars:
-      maintenance_shared_snapshot: true
-  - &id001
-    name: Gate maintenance on healthy workloads and supported kured coordination
-    ansible.builtin.command:
-      argv:
-      - '{{ ansible_playbook_python }}'
-      - -B
-      - -c
-      - '{{ lookup(''ansible.builtin.file'', playbook_dir + ''/files/maintenance_health.py'') }}'
-      stdin: '{{ {''resources'': maintenance_resources.stdout | from_json, ''version'': maintenance_api.stdout | from_json,
-        ''node'': maintenance_node, ''transition'': true} | to_json }}'
-    delegate_to: localhost
-    vars:
-      ansible_connection: local
-      ansible_python_interpreter: '{{ ansible_playbook_python }}'
-      ansible_remote_tmp: '{{ lookup(''ansible.builtin.env'', ''HOME'') + ''/.ansible/tmp'' }}'
-    become: false
-    register: maintenance_preflight
-    changed_when: false
-  - name: Retain original node identity
-    ansible.builtin.set_fact:
-      maintenance_baseline: '{{ maintenance_preflight.stdout | from_json }}'
-  - name: Discover installed packages before mutations
-    ansible.builtin.command:
-      argv:
-      - pacman
-      - -Q
-    register: maintenance_packages_before
-    changed_when: false
-  - name: Discover protected Kubernetes package versions
-    ansible.builtin.command:
-      argv:
-      - pacman
-      - -Q
-      - kubeadm
-      - kubelet
-      - kubectl
-    register: maintenance_protected_before
-    changed_when: false
-  - name: Discover Kubernetes binary versions
-    ansible.builtin.command:
-      argv: '{{ item }}'
-    loop:
-    - - kubeadm
-      - version
-      - -o
-      - short
-    - - kubelet
-      - --version
-    - - kubectl
-      - version
-      - --client
-      - -o
-      - json
-    register: maintenance_binaries
-    changed_when: false
-  - name: Require binaries to match installed package versions
-    ansible.builtin.assert:
-      that:
-      - maintenance_binaries.results[0].stdout | trim == "v" + maintenance_installed_versions.kubeadm.split("-")[0]
-      - maintenance_binaries.results[1].stdout.split()[-1] == "v" + maintenance_installed_versions.kubelet.split("-")[0]
-      - (maintenance_binaries.results[2].stdout | from_json).clientVersion.gitVersion == "v" + maintenance_installed_versions.kubectl.split("-")[0]
-    vars:
-      maintenance_installed_versions: '{{ dict(maintenance_protected_before.stdout_lines | map("split")) }}'
-  - name: Read host boot identity
-    ansible.builtin.slurp:
-      src: /proc/sys/kernel/random/boot_id
-    register: maintenance_boot_before
-  - name: Verify Kubernetes node mapping matches the managed host
-    ansible.builtin.assert:
-      that: maintenance_boot_before.content | b64decode | trim == maintenance_baseline.boot
-  - name: Inspect lock and reboot markers before mutation
-    ansible.builtin.stat:
-      path: '{{ item }}'
-    loop:
-    - /var/lib/pacman/db.lck
-    - /var/lib/kured/reboot-required
-    - /var/run/reboot-required
-    register: maintenance_markers
-  - name: Reject package activity or an already requested kured reboot
-    ansible.builtin.assert:
-      that:
-      - not maintenance_markers.results[0].stat.exists
-      - not maintenance_markers.results[1].stat.exists
-      fail_msg: Resolve existing package activity or kured reboot request before starting maintenance.
-  - name: Read required boot-only sentinel cleanup rule
-    ansible.builtin.slurp:
-      src: /etc/tmpfiles.d/kured-maintenance.conf
-    register: maintenance_cleanup
-  - name: Require boot-only removal of the dedicated disk sentinel
-    ansible.builtin.assert:
-      that: maintenance_cleanup.content | b64decode | trim == 'r! /var/lib/kured/reboot-required - - - -'
-      fail_msg: Provision the documented boot-only tmpfiles rule before maintenance; a persistent sentinel can cause a reboot
-        loop.
-  - name: Verify boot tmpfiles service ran successfully
-    ansible.builtin.command:
-      argv:
-      - systemctl
-      - is-active
-      - systemd-tmpfiles-setup.service
-    changed_when: false
-  - name: Prepare every archive before cluster mutations
-    ansible.builtin.include_tasks: tasks/maintenance-prepare.yml
-  - name: Refresh cluster after all package preparation
-    ansible.builtin.include_tasks: tasks/maintenance-snapshot.yml
-    vars:
-      maintenance_shared_snapshot: true
-  - *id001
-  - name: Retain refreshed pre-mutation identity
-    ansible.builtin.set_fact:
-      maintenance_baseline: '{{ maintenance_preflight.stdout | from_json }}'
-      maintenance_initial_api: '{{ (maintenance_api.stdout | from_json).serverVersion.gitVersion }}'
-  - name: Reject host boot changes during preparation
-    ansible.builtin.assert:
-      that: maintenance_boot_before.content | b64decode | trim == maintenance_baseline.boot
-  - name: Inspect unfinished node maintenance
-    ansible.builtin.stat:
-      path: /var/lib/ansible-maintenance/pending.json
-    register: maintenance_pending_stat
-  - name: Read unfinished node maintenance
-    ansible.builtin.slurp:
-      src: /var/lib/ansible-maintenance/pending.json
-    register: maintenance_pending_read
-    when: maintenance_pending_stat.stat.exists
-  - name: Reject malformed unfinished maintenance record
-    ansible.builtin.assert:
-      that: (maintenance_pending_read.content | b64decode | from_json) is mapping
-    when: maintenance_pending_stat.stat.exists
-  - name: Read actual kubeadm cluster configuration before planning
-    ansible.builtin.command:
-      argv: "{{ ['timeout', '30s'] + maintenance_ssh_argv + [(maintenance_kubectl_argv + ['get', 'configmap', 'kubeadm-config', '-n', 'kube-system', '-o', 'json']) | map('quote') | join(' ')] }}"
-      expand_argument_vars: false
-    delegate_to: localhost
-    vars:
-      ansible_connection: local
-      ansible_python_interpreter: '{{ ansible_playbook_python }}'
-      ansible_remote_tmp: "{{ lookup('ansible.builtin.env', 'HOME') + '/.ansible/tmp' }}"
-    become: false
-    register: maintenance_cluster_config
-    changed_when: false
-    run_once: true
-  - name: Retain mapped node input for cluster-wide transition gate
-    ansible.builtin.set_fact:
-      maintenance_transition_input:
-        host: '{{ inventory_hostname }}'
-        node: '{{ maintenance_node }}'
-        uid: '{{ maintenance_node_object.metadata.uid }}'
-        control_plane: '{{ "node-role.kubernetes.io/control-plane" in maintenance_node_object.metadata.labels }}'
-        schedulable: '{{ not maintenance_node_object.spec.unschedulable | default(false) }}'
-        reported: '{{ maintenance_baseline.version }}'
-        installed: '{{ dict(maintenance_protected_before.stdout_lines | map("split")) }}'
-        candidates: '{{ maintenance_manifest.candidates }}'
-        pending: '{{ (maintenance_pending_read.content | b64decode | from_json) if maintenance_pending_stat.stat.exists else none }}'
-        cluster_config: '{{ ((maintenance_cluster_config.stdout | from_json).data.ClusterConfiguration | from_yaml).kubernetesVersion }}'
-    vars:
-      maintenance_node_object: '{{ (maintenance_resources.stdout | from_json)["items"] | selectattr("kind", "equalto", "Node")
-        | selectattr("metadata.name", "equalto", maintenance_node) | first }}'
-  - name: Validate complete cluster target and transition before any drain
-    ansible.builtin.command:
-      argv:
-      - '{{ ansible_playbook_python }}'
-      - -B
-      - -c
-      - '{{ lookup(''ansible.builtin.file'', playbook_dir + ''/files/maintenance_transition.py'') }}'
-      stdin: '{{ {''api'': (maintenance_api.stdout | from_json).serverVersion.gitVersion, ''inventory'': groups[''kubernetes''],
-        ''cluster_nodes'': (maintenance_resources.stdout | from_json)[''items''] | selectattr(''kind'', ''equalto'', ''Node'')
-        | map(attribute=''metadata.name'') | list, ''nodes'': groups[''kubernetes''] | map(''extract'', hostvars, ''maintenance_transition_input'')
-        | list} | to_json }}'
-    run_once: true
-    register: maintenance_planned
-    changed_when: false
-    delegate_to: localhost
-    vars: &id002
-      ansible_connection: local
-      ansible_python_interpreter: '{{ ansible_playbook_python }}'
-      ansible_remote_tmp: '{{ lookup(''ansible.builtin.env'', ''HOME'') + ''/.ansible/tmp'' }}'
-    become: false
-  - name: Retain cluster-wide plan
-    ansible.builtin.set_fact:
-      maintenance_plan: '{{ maintenance_planned.stdout | from_json }}'
-  - name: Require the supported controller mapping
-    ansible.builtin.assert:
-      that:
-      - maintenance_plan.nodes[0].host == "kube"
-      fail_msg: Do not limit this maintenance play; all nodes must be prepared and gated.
-  - name: Reject prematurely installed newer kubelet before API transition
-    ansible.builtin.assert:
-      that: not maintenance_plan.upgrade_api or (maintenance_transition_input.installed.kubelet.split("-")[0] is version((maintenance_api.stdout
-        | from_json).serverVersion.gitVersion | regex_replace("^v", ""), "<="))
-      fail_msg: Newer kubelet is already installed before the API transition; reconcile this unsafe partial installation before
-        maintenance.
-  - name: Server dry-run every intended drain before mutation
-    ansible.builtin.command:
-      argv: '{{ [''timeout'', ''330s''] + maintenance_ssh_argv + [(maintenance_kubectl_argv + [''drain'', maintenance_node,
-        ''--ignore-daemonsets'', ''--timeout=300s'', ''--dry-run=server''] + ([''--delete-emptydir-data''] if maintenance_delete_emptydir_data
-        | bool else [])) | map(''quote'') | join('' '')] }}'
-      expand_argument_vars: false
-    changed_when: false
-    delegate_to: localhost
-    vars: *id002
-    become: false
-- name: Maintain control plane first
-  hosts: kube
+    - name: Remove package staging and records of the previous design
+      ansible.builtin.command:
+        argv:
+          - find
+          - /var/lib/ansible-maintenance
+          - -maxdepth
+          - "1"
+          - (
+          - -name
+          - packages-*
+          - -o
+          - -name
+          - pending.json
+          - -o
+          - -name
+          - completed.json
+          - )
+          - -print
+          - -exec
+          - rm
+          - -rf
+          - "{}"
+          - +
+      register: node_update_cleanup
+      changed_when: node_update_cleanup.stdout != ""
+
+    - name: Sync the package databases
+      community.general.pacman:
+        update_cache: true
+
+    - name: Download pending repository packages into the pacman cache
+      community.general.pacman:
+        upgrade: true
+        upgrade_extra_args: --downloadonly
+      register: node_update_download
+      changed_when: "'Retrieving packages' in node_update_download.stdout | default('')"
+
+    - name: List pending AUR upgrades
+      ansible.builtin.command:
+        argv: [paru, -Qua, --color, never]
+      become: false
+      register: node_update_aur
+      changed_when: false
+      failed_when: node_update_aur.rc not in [0, 1]
+
+    - name: Select the nodes that have upgrades
+      ansible.builtin.group_by:
+        key: node_update_pending
+      when: node_update_repo_pending | length > 0 or node_update_aur_pending | length > 0
+      changed_when: false
+
+- name: Upgrade the pending nodes one at a time, control plane first
+  hosts: kube:kubernetes:&node_update_pending
   become: true
   gather_facts: false
   serial: 1
   any_errors_fatal: true
-  vars: *id003
   tasks:
-  - name: Run guarded node maintenance
-    ansible.builtin.include_tasks: tasks/maintenance-node.yml
-- name: Maintain workers sequentially
-  hosts: kubernetes:!kube
+    - name: Record the start time
+      ansible.builtin.set_fact:
+        node_update_started: "{{ now().timestamp() | int }}"
+
+    - name: Drain, upgrade and return the node
+      when: node_update_repo_pending | length > 0
+      block:
+        - name: Wait for the API server to be ready
+          ansible.builtin.command:
+            argv: "{{ node_update_kubectl + ['get', '--raw=/readyz'] }}"
+          delegate_to: "{{ node_update_control_plane }}"
+          register: node_update_readyz
+          changed_when: false
+          until: node_update_readyz.rc == 0
+          retries: 30
+          delay: 5
+
+        - name: Wait for every node to be Ready
+          ansible.builtin.command:
+            argv: "{{ node_update_kubectl + ['wait', 'nodes', '--all', '--for=condition=Ready',
+              '--timeout=' ~ node_update_wait_timeout ~ 's'] }}"
+          delegate_to: "{{ node_update_control_plane }}"
+          changed_when: false
+
+        - name: Wait for every deployment to be available
+          ansible.builtin.command:
+            argv: "{{ node_update_kubectl + ['wait', 'deployments', '--all', '--all-namespaces',
+              '--for=condition=Available', '--timeout=' ~ node_update_wait_timeout ~ 's'] }}"
+          delegate_to: "{{ node_update_control_plane }}"
+          changed_when: false
+
+        - name: Read the node state before the drain
+          ansible.builtin.command:
+            argv: "{{ node_update_kubectl + ['get', 'node', node_update_node_name, '-o', 'json'] }}"
+          delegate_to: "{{ node_update_control_plane }}"
+          register: node_update_node_read
+          changed_when: false
+
+        - name: Check the Kubernetes version step
+          when: node_update_kubernetes_pending
+          block:
+            - name: Read the Kubernetes version offered by the repository
+              ansible.builtin.command:
+                argv: [pacman, -Sp, --print-format, "%v", kubeadm]
+              register: node_update_kube_candidate
+              changed_when: false
+
+            - name: Read the API server version
+              ansible.builtin.command:
+                argv: "{{ node_update_kubectl + ['version', '-o', 'json'] }}"
+              delegate_to: "{{ node_update_control_plane }}"
+              register: node_update_api
+              changed_when: false
+
+            - name: Require a supported Kubernetes version step
+              ansible.builtin.assert:
+                that: node_update_kube_step_supported
+                quiet: true
+                fail_msg: >-
+                  Kubernetes {{ node_update_kube_target }} is not a supported step on {{ node_update_node_name }}
+                  while the API server is at {{ node_update_api_version }}.
+
+        - name: Drain the node
+          ansible.builtin.command:
+            argv: "{{ node_update_kubectl + ['drain', node_update_node_name, '--ignore-daemonsets',
+              '--delete-emptydir-data', '--timeout=' ~ node_update_drain_timeout ~ 's'] }}"
+          delegate_to: "{{ node_update_control_plane }}"
+          register: node_update_drain
+          changed_when: "'evicted' in node_update_drain.stdout or not node_update_was_cordoned"
+
+        - name: Upgrade Kubernetes with kubeadm before the kubelet
+          when: node_update_kubernetes_pending
+          block:
+            - name: Back up /etc/kubernetes and etcd before the control plane upgrade
+              when: node_update_kubeadm_apply
+              block:
+                - name: Create the backup directory
+                  ansible.builtin.file:
+                    path: "{{ node_update_backup_dir }}"
+                    state: directory
+                    mode: "0700"
+
+                - name: Archive /etc/kubernetes
+                  ansible.builtin.command:
+                    argv: [tar, -C, /, -czf, "{{ node_update_backup_dir }}/etc-kubernetes.tar.gz", etc/kubernetes]
+                    creates: "{{ node_update_backup_dir }}/etc-kubernetes.tar.gz"
+
+                - name: Find the etcd container
+                  ansible.builtin.command:
+                    argv: "{{ node_update_crictl + ['ps', '--name', 'etcd', '--quiet'] }}"
+                  register: node_update_etcd
+                  changed_when: false
+
+                - name: Save an etcd snapshot
+                  ansible.builtin.command:
+                    argv: "{{ node_update_crictl + ['exec', node_update_etcd.stdout_lines | first, 'etcdctl',
+                      '--endpoints=https://127.0.0.1:2379', '--cacert=/etc/kubernetes/pki/etcd/ca.crt',
+                      '--cert=/etc/kubernetes/pki/etcd/server.crt', '--key=/etc/kubernetes/pki/etcd/server.key',
+                      'snapshot', 'save', node_update_etcd_data ~ '/pre-upgrade-snapshot.db'] }}"
+                  changed_when: true
+
+                - name: Move the etcd snapshot into the backup directory
+                  ansible.builtin.command:
+                    argv:
+                      - mv
+                      - "{{ node_update_etcd_data }}/pre-upgrade-snapshot.db"
+                      - "{{ node_update_backup_dir }}/etcd-snapshot.db"
+                    removes: "{{ node_update_etcd_data }}/pre-upgrade-snapshot.db"
+
+            - name: Install the new kubeadm
+              community.general.pacman:
+                name: kubeadm
+                state: latest
+
+            - name: Upgrade the control plane
+              ansible.builtin.command:
+                argv: [kubeadm, upgrade, apply, "v{{ node_update_kube_target }}", --yes]
+              when: node_update_kubeadm_apply
+              changed_when: true
+
+            - name: Upgrade the kubelet configuration of the worker
+              ansible.builtin.command:
+                argv: [kubeadm, upgrade, node]
+              when: node_update_kubeadm_node
+              changed_when: true
+
+        - name: Install the downloaded upgrade
+          community.general.pacman:
+            upgrade: true
+
+        - name: Read the running kernel release
+          ansible.builtin.command:
+            argv: [uname, -r]
+          register: node_update_kernel
+          changed_when: false
+
+        - name: Check that the running kernel is still the installed one
+          ansible.builtin.stat:
+            path: /usr/lib/modules/{{ node_update_kernel.stdout }}/vmlinuz
+          register: node_update_kernel_stat
+
+        - name: Check for the reboot marker of the pacman hooks
+          ansible.builtin.stat:
+            path: "{{ node_update_reboot_marker }}"
+          register: node_update_marker_stat
+
+        - name: Reboot the node
+          ansible.builtin.reboot:
+            reboot_timeout: "{{ node_update_reboot_timeout }}"
+          when: node_update_reboot_required
+          register: node_update_reboot
+
+        - name: Restart containerd after its packages changed
+          ansible.builtin.systemd_service:
+            name: containerd
+            state: restarted
+          when:
+            - not node_update_reboot_required
+            - node_update_repo_pending | intersect(['containerd', 'runc']) | length > 0
+
+        - name: Restart the kubelet after the Kubernetes packages changed
+          ansible.builtin.systemd_service:
+            name: kubelet
+            state: restarted
+            daemon_reload: true
+          when:
+            - not node_update_reboot_required
+            - node_update_kubernetes_pending
+
+        - name: Read the installed kubelet version
+          ansible.builtin.command:
+            argv: [kubelet, --version]
+          register: node_update_kubelet
+          changed_when: false
+
+        - name: Read the boot ID
+          ansible.builtin.slurp:
+            src: /proc/sys/kernel/random/boot_id
+          register: node_update_boot
+
+        - name: Wait for the API server port
+          ansible.builtin.wait_for:
+            port: 6443
+            timeout: "{{ node_update_wait_timeout }}"
+          delegate_to: "{{ node_update_control_plane }}"
+
+        - name: Wait for the API server to be ready again
+          ansible.builtin.command:
+            argv: "{{ node_update_kubectl + ['get', '--raw=/readyz'] }}"
+          delegate_to: "{{ node_update_control_plane }}"
+          register: node_update_readyz
+          changed_when: false
+          until: node_update_readyz.rc == 0
+          retries: 30
+          delay: 5
+
+        - name: Wait for the node to report this boot, the installed kubelet and Ready
+          ansible.builtin.command:
+            argv: "{{ node_update_kubectl + ['wait', 'node/' ~ node_update_node_name, '--for=' ~ item,
+              '--timeout=' ~ node_update_wait_timeout ~ 's'] }}"
+          delegate_to: "{{ node_update_control_plane }}"
+          loop:
+            - jsonpath={.status.nodeInfo.bootID}={{ node_update_boot.content | b64decode | trim }}
+            - jsonpath={.status.nodeInfo.kubeletVersion}={{ node_update_kubelet.stdout.split() | last }}
+            - condition=Ready
+          changed_when: false
+
+        - name: Uncordon the node
+          ansible.builtin.command:
+            argv: "{{ node_update_kubectl + ['uncordon', node_update_node_name] }}"
+          delegate_to: "{{ node_update_control_plane }}"
+          when: not node_update_was_cordoned
+          changed_when: true
+
+    - name: Build and install pending AUR upgrades
+      ansible.builtin.command:
+        argv: [paru, -Sua, --noconfirm, --skipreview]
+      become: false
+      when: node_update_aur_pending | length > 0
+      changed_when: true
+      timeout: "{{ node_update_aur_timeout }}"
+
+    - name: Record the result
+      ansible.builtin.set_fact:
+        node_update_rebooted: "{{ node_update_reboot.rebooted | default(false) }}"
+        node_update_elapsed: "{{ now().timestamp() | int - node_update_started | int }}"
+
+- name: Summarize the update
+  hosts: kubernetes
   become: true
   gather_facts: false
-  serial: 1
-  any_errors_fatal: true
-  vars: *id003
   tasks:
-  - name: Run guarded node maintenance
-    ansible.builtin.include_tasks: tasks/maintenance-node.yml
+    - name: Read the kubelet version the node reports
+      ansible.builtin.command:
+        argv: "{{ node_update_kubectl + ['get', 'node', node_update_node_name,
+          '-o', 'jsonpath={.status.nodeInfo.kubeletVersion}'] }}"
+      delegate_to: "{{ node_update_control_plane }}"
+      register: node_update_reported
+      changed_when: false
+
+    - name: Show the result per node
+      ansible.builtin.debug:
+        msg: "{{ node_update_summary }}"

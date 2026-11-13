@@ -1,0 +1,50 @@
+---
+# Settings and derived values of playbooks/kubernetes-nodes-update-v2.yml.
+
+node_update_control_plane: kube
+node_update_node_name: "{{ 'kube-controller' if inventory_hostname == node_update_control_plane else inventory_hostname }}"
+node_update_kubectl: [kubectl, --kubeconfig=/etc/kubernetes/admin.conf]
+node_update_crictl: [crictl, --runtime-endpoint, unix:///run/containerd/containerd.sock]
+node_update_drain_timeout: 300
+node_update_wait_timeout: 300
+node_update_reboot_timeout: 600
+node_update_aur_timeout: 3600
+
+# Written by the pacman hooks on the nodes; /run is cleared by the reboot.
+node_update_reboot_marker: /run/reboot-required
+# Upgrades that only take effect after a reboot. The running kernel is
+# covered separately by checking that its image is still installed.
+node_update_reboot_packages: ^(linux-firmware.*|(amd|intel)-ucode|systemd(-libs)?|glibc)$
+node_update_etcd_data: /var/lib/etcd
+node_update_backup_dir: /var/lib/ansible-maintenance/control-plane-backup-{{ node_update_started }}
+
+node_update_repo_pending: "{{ node_update_download.packages | default([]) }}"
+node_update_aur_pending: "{{ node_update_aur.stdout_lines | default([]) }}"
+node_update_kubernetes_pending: "{{ node_update_repo_pending | intersect(['kubeadm', 'kubelet']) | length > 0 }}"
+node_update_reboot_required: >-
+  {{ node_update_marker_stat.stat.exists
+     or not node_update_kernel_stat.stat.exists
+     or node_update_repo_pending | select('match', node_update_reboot_packages) | list | length > 0 }}
+
+node_update_node_before: "{{ node_update_node_read.stdout | from_json }}"
+node_update_was_cordoned: "{{ node_update_node_before.spec.unschedulable | default(false) }}"
+node_update_kube_target: "{{ node_update_kube_candidate.stdout.split('-') | first }}"
+node_update_api_version: "{{ (node_update_api.stdout | from_json).serverVersion.gitVersion | regex_replace('^v', '') }}"
+# Control plane: same version or one minor up. Worker: never past the API server.
+node_update_kube_step_supported: >-
+  {{ (node_update_kube_target is version(node_update_api_version, '>=')
+      and node_update_kube_target.split('.')[0] == node_update_api_version.split('.')[0]
+      and (node_update_kube_target.split('.')[1] | int) - (node_update_api_version.split('.')[1] | int) <= 1)
+     if inventory_hostname == node_update_control_plane
+     else node_update_kube_target is version(node_update_api_version, '<=') }}
+node_update_kubeadm_apply: "{{ inventory_hostname == node_update_control_plane and node_update_kube_target != node_update_api_version }}"
+node_update_kubeadm_node: >-
+  {{ inventory_hostname != node_update_control_plane
+     and 'v' ~ node_update_kube_target != node_update_node_before.status.nodeInfo.kubeletVersion }}
+
+node_update_summary: >-
+  {{ node_update_node_name }}:
+  {{ node_update_repo_pending | length + node_update_aur_pending | length }} packages upgraded,
+  rebooted {{ 'yes' if node_update_rebooted | default(false) else 'no' }},
+  kubelet {{ node_update_reported.stdout }},
+  {{ node_update_elapsed | default(0) }} s
