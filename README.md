@@ -11,7 +11,7 @@ Production-grade Ansible playbooks for Linux infrastructure management — Kuber
 |---|---|---|
 | `cluster-perf-tuning.yml` | Kubernetes nodes | CPU governor, THP, network buffers, containerd tuning |
 | `kubernetes-nodes-update-v2.yml` | Kubernetes nodes | Rolling OS and Kubernetes upgrade: drain, upgrade, reboot when needed |
-| `refresh-mirrors.yml` | Kubernetes nodes | CachyOS mirror refresh via cachyos-rate-mirrors |
+| `refresh-mirrors.yml` | Kubernetes nodes | CachyOS mirror refresh via cachyos-rate-mirrors, then the first 5 servers of every mirrorlist ordered by measured download speed |
 | `update-upgrade.yml` | Mixed (Debian/Arch) | OS-aware package upgrades with async execution |
 | `update-jenkins-plugins.yml` | Jenkins host | Automated Jenkins plugin updates via API |
 
@@ -28,7 +28,7 @@ Copy and adapt `ansible.cfg` to your environment. Key settings:
 - `become_method = doas` — uses doas instead of sudo
 - `forks = 50` — parallel execution
 - `fact_caching = jsonfile` — caches facts for 1 hour
-- `pipelining = true` — SSH connection reuse for performance
+- `pipelining = true` — runs modules over the open SSH session without copying files first (connection reuse comes from `ControlPersist` in `ssh_args`)
 
 Create a dedicated `ansible` user on all managed nodes with your SSH public key in `~/.ssh/authorized_keys`.
 
@@ -72,7 +72,7 @@ ansible-playbook playbooks/refresh-mirrors.yml
 ansible-playbook playbooks/kubernetes-nodes-update-v2.yml
 ```
 
-1. **Download (all nodes in parallel):** syncs the pacman databases, downloads every pending repository package into the normal pacman cache and lists pending AUR upgrades. Nodes with nothing pending are left alone; if no node has anything pending the run ends here.
+1. **Download (all nodes in parallel):** syncs the pacman databases, downloads every pending repository package into the normal pacman cache and lists pending AUR upgrades. Nodes with nothing pending are left alone; if no node has anything pending, nothing is drained and only the summary follows.
 2. **Upgrade (one node at a time, control plane first, stops on the first failure):**
    - waits until the API answers `/readyz`, every node is Ready and every Deployment is Available
    - `kubectl drain --ignore-daemonsets --delete-emptydir-data` with a timeout; PodDisruptionBudgets are respected
