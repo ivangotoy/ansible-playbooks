@@ -26,10 +26,37 @@
       changed_when: false
       failed_when: node_update_aur.rc not in [0, 1]
 
-    - name: Select the nodes that have upgrades
+    - name: Read the running kernel release
+      ansible.builtin.command:
+        argv: [uname, -r]
+      register: node_update_kernel
+      changed_when: false
+
+    - name: Check that the running kernel is still the installed one
+      ansible.builtin.stat:
+        path: /usr/lib/modules/{{ node_update_kernel.stdout }}/vmlinuz
+      register: node_update_kernel_stat
+
+    - name: Check for the reboot marker of the pacman hooks
+      ansible.builtin.stat:
+        path: "{{ node_update_reboot_marker }}"
+      register: node_update_marker_stat
+
+    - name: Read the node annotations
+      ansible.builtin.command:
+        argv: "{{ node_update_kubectl + ['get', 'node', node_update_node_name, '-o', 'json'] }}"
+      delegate_to: "{{ node_update_control_plane }}"
+      register: node_update_node_check
+      changed_when: false
+
+    - name: Resume a node with an outstanding reboot or a cordon left by an interrupted run
+      ansible.builtin.set_fact:
+        node_update_resume: "{{ node_update_resume_needed }}"
+
+    - name: Select the nodes that have upgrades or need to be resumed
       ansible.builtin.group_by:
         key: node_update_pending
-      when: node_update_repo_pending | length > 0 or node_update_aur_pending | length > 0
+      when: node_update_selected
       changed_when: false
 
 - name: Upgrade the pending nodes one at a time, control plane first
@@ -44,7 +71,7 @@
         node_update_started: "{{ now().timestamp() | int }}"
 
     - name: Drain, upgrade and return the node
-      when: node_update_repo_pending | length > 0
+      when: node_update_repo_pending | length > 0 or node_update_resume
       block:
         - name: Wait for the API server to be ready
           ansible.builtin.command:
@@ -100,6 +127,14 @@
                 fail_msg: >-
                   Kubernetes {{ node_update_kube_target }} is not a supported step on {{ node_update_node_name }}
                   while the API server is at {{ node_update_api_version }}.
+
+        - name: Mark the node as cordoned by this run
+          ansible.builtin.command:
+            argv: "{{ node_update_kubectl + ['annotate', '--overwrite', 'node', node_update_node_name,
+              node_update_cordon_annotation ~ '=' ~ node_update_started] }}"
+          delegate_to: "{{ node_update_control_plane }}"
+          when: not node_update_was_cordoned
+          changed_when: true
 
         - name: Drain the node
           ansible.builtin.command:
@@ -243,6 +278,13 @@
         - name: Uncordon the node
           ansible.builtin.command:
             argv: "{{ node_update_kubectl + ['uncordon', node_update_node_name] }}"
+          delegate_to: "{{ node_update_control_plane }}"
+          when: not node_update_was_cordoned
+          changed_when: true
+
+        - name: Remove the cordon mark of this run
+          ansible.builtin.command:
+            argv: "{{ node_update_kubectl + ['annotate', 'node', node_update_node_name, node_update_cordon_annotation ~ '-'] }}"
           delegate_to: "{{ node_update_control_plane }}"
           when: not node_update_was_cordoned
           changed_when: true

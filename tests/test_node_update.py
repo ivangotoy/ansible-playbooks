@@ -90,9 +90,58 @@ class StateTests(unittest.TestCase):
                          'node-09: 0 packages upgraded, rebooted no, kubelet v1.50.1, 0 s')
 
 
+class ResumeTests(unittest.TestCase):
+    """A run that died after the drain must be finished by the next run."""
+
+    def select(self, packages=(), aur=(), marker=False, kernel=True, annotations=None):
+        metadata = {} if annotations is None else {'annotations': annotations}
+        return render('node_update_selected', node_update_download={'packages': list(packages)},
+                      node_update_aur={'stdout_lines': list(aur)},
+                      node_update_marker_stat=stat(marker), node_update_kernel_stat=stat(kernel),
+                      node_update_node_check={'stdout': json.dumps({'metadata': metadata})})
+
+    def test_idle_node_is_left_alone(self):
+        self.assertIs(self.select(annotations={'other': 'x'}), False)
+
+    def test_pending_packages_select_the_node(self):
+        self.assertIs(self.select(packages=['bash']), True)
+        self.assertIs(self.select(aur=['x 1 -> 2']), True)
+
+    def test_outstanding_reboot_selects_the_node(self):
+        self.assertIs(self.select(marker=True), True)
+        self.assertIs(self.select(kernel=False), True)
+
+    def test_cordon_left_by_an_interrupted_run_selects_the_node(self):
+        self.assertIs(self.select(annotations={VARS['node_update_cordon_annotation']: '1700000000'}), True)
+
+    def test_resumed_node_is_rebooted_without_pending_packages(self):
+        self.assertIs(render('node_update_reboot_required', node_update_resume=True, node_update_download={},
+                             node_update_marker_stat=stat(False), node_update_kernel_stat=stat(True)), True)
+
+    def test_cordon_of_an_interrupted_run_is_lifted_but_an_operator_cordon_is_kept(self):
+        mark = VARS['node_update_cordon_annotation']
+        for annotations, expected in (({mark: '1700000000'}, False), ({}, True)):
+            read = {'stdout': json.dumps({'spec': {'unschedulable': True}, 'metadata': {'annotations': annotations}})}
+            with self.subTest(annotations=annotations):
+                self.assertIs(render('node_update_was_cordoned', node_update_node_read=read), expected)
+
+
 class PlaybookTests(unittest.TestCase):
     def test_nodes_are_upgraded_one_at_a_time_control_plane_first_and_stop_on_failure(self):
         play = PLAYS[1]
         self.assertEqual(play['hosts'], VARS['node_update_control_plane'] + ':kubernetes:&node_update_pending')
         self.assertEqual(play['serial'], 1)
         self.assertIs(play['any_errors_fatal'], True)
+
+    def test_selection_and_upgrade_cover_resumed_nodes(self):
+        tasks = {task['name']: task for task in PLAYS[0]['tasks']}
+        self.assertEqual(tasks['Select the nodes that have upgrades or need to be resumed']['when'],
+                         'node_update_selected')
+        block = PLAYS[1]['tasks'][1]
+        self.assertIn('node_update_resume', block['when'])
+
+    def test_cordon_mark_is_set_before_the_drain_and_removed_after_the_uncordon(self):
+        names = [task['name'] for task in PLAYS[1]['tasks'][1]['block']]
+        order = [names.index(name) for name in ('Mark the node as cordoned by this run', 'Drain the node',
+                                                'Uncordon the node', 'Remove the cordon mark of this run')]
+        self.assertEqual(order, sorted(order))

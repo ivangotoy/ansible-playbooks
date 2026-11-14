@@ -21,13 +21,31 @@ node_update_backup_dir: /var/lib/ansible-maintenance/control-plane-backup-{{ nod
 node_update_repo_pending: "{{ node_update_download.packages | default([]) }}"
 node_update_aur_pending: "{{ node_update_aur.stdout_lines | default([]) }}"
 node_update_kubernetes_pending: "{{ node_update_repo_pending | intersect(['kubeadm', 'kubelet']) | length > 0 }}"
+node_update_reboot_pending: "{{ node_update_marker_stat.stat.exists or not node_update_kernel_stat.stat.exists }}"
+# A node resumed after an interrupted run is always rebooted: the run may have
+# died after the install, before the reboot or the service restarts.
 node_update_reboot_required: >-
-  {{ node_update_marker_stat.stat.exists
-     or not node_update_kernel_stat.stat.exists
+  {{ node_update_resume | default(false)
+     or node_update_reboot_pending
      or node_update_repo_pending | select('match', node_update_reboot_packages) | list | length > 0 }}
 
+# Set before the drain and removed after the uncordon, so a node that still
+# carries it was cordoned by an interrupted run and not by an operator.
+node_update_cordon_annotation: ansible-node-update/cordoned
+node_update_cordoned_by_run: >-
+  {{ node_update_cordon_annotation in
+     ((node_update_node_check.stdout | from_json).metadata.annotations | default({})) }}
+# Play 1: a node without pending packages still needs the drain, reboot and
+# uncordon when a reboot is outstanding or an earlier run left it cordoned.
+node_update_resume_needed: "{{ node_update_reboot_pending or node_update_cordoned_by_run }}"
+node_update_selected: >-
+  {{ node_update_repo_pending | length > 0 or node_update_aur_pending | length > 0
+     or node_update_resume_needed }}
+
 node_update_node_before: "{{ node_update_node_read.stdout | from_json }}"
-node_update_was_cordoned: "{{ node_update_node_before.spec.unschedulable | default(false) }}"
+node_update_was_cordoned: >-
+  {{ (node_update_node_before.spec.unschedulable | default(false))
+     and node_update_cordon_annotation not in (node_update_node_before.metadata.annotations | default({})) }}
 node_update_kube_target: "{{ node_update_kube_candidate.stdout.split('-') | first }}"
 node_update_api_version: "{{ (node_update_api.stdout | from_json).serverVersion.gitVersion | regex_replace('^v', '') }}"
 # Control plane: same version or one minor up. Worker: never past the API server.

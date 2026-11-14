@@ -72,20 +72,20 @@ ansible-playbook playbooks/refresh-mirrors.yml
 ansible-playbook playbooks/kubernetes-nodes-update-v2.yml
 ```
 
-1. **Download (all nodes in parallel):** syncs the pacman databases, downloads every pending repository package into the normal pacman cache and lists pending AUR upgrades. Nodes with nothing pending are left alone; if no node has anything pending, nothing is drained and only the summary follows.
+1. **Download (all nodes in parallel):** syncs the pacman databases, downloads every pending repository package into the normal pacman cache and lists pending AUR upgrades. A node is also selected when a reboot is outstanding (`/run/reboot-required` exists or the image of the running kernel is gone) or when it still carries the `ansible-node-update/cordoned` annotation of an interrupted run; such a resumed node is drained, rebooted and uncordoned even with nothing pending. Other nodes are left alone; if no node is selected, nothing is drained and only the summary follows.
 2. **Upgrade (one node at a time, control plane first, stops on the first failure):**
    - waits until the API answers `/readyz`, every node is Ready and every Deployment is Available
-   - `kubectl drain --ignore-daemonsets --delete-emptydir-data` with a timeout; PodDisruptionBudgets are respected
+   - annotates the node with `ansible-node-update/cordoned` (unless it was cordoned before the run), then `kubectl drain --ignore-daemonsets --delete-emptydir-data` with a timeout; PodDisruptionBudgets are respected
    - only when `kubeadm`/`kubelet` are pending: checks the version step (control plane at most one minor up, a worker never past the API server), installs `kubeadm` first, then runs `kubeadm upgrade apply` on the control plane (after an etcd snapshot and an `/etc/kubernetes` archive under `/var/lib/ansible-maintenance/control-plane-backup-*`) or `kubeadm upgrade node` on a worker
    - installs the downloaded upgrade with `pacman -Su`
-   - reboots with `ansible.builtin.reboot` when the image of the running kernel is gone, `/run/reboot-required` exists or a boot-critical package was upgraded (`node_update_reboot_packages`); otherwise restarts only containerd and the kubelet when their packages changed
-   - waits until the node reports the new boot ID, the installed kubelet version and Ready, then uncordons it. A node that was cordoned before the run stays cordoned.
+   - reboots with `ansible.builtin.reboot` when the image of the running kernel is gone, `/run/reboot-required` exists or a boot-critical package was upgraded (`node_update_reboot_packages`) or the node is resumed from an interrupted run; otherwise restarts only containerd and the kubelet when their packages changed
+   - waits until the node reports the new boot ID, the installed kubelet version and Ready, then uncordons it and removes the annotation. A node that was cordoned before the run (without the annotation) stays cordoned.
    - builds and installs pending AUR upgrades with `paru -Sua` after the node is back in service
 3. **Summary:** one line per node: packages upgraded, rebooted yes/no, kubelet version, elapsed seconds.
 
 Settings live in `group_vars/kubernetes.yml` (control plane host, node name mapping, timeouts, reboot package pattern). kubectl runs on the control plane host with `/etc/kubernetes/admin.conf`. The playbook does not use kured and never writes its sentinel.
 
-After a failure the node stays cordoned and no further node is touched: fix the cause, `kubectl uncordon` the node if it is healthy, and run the playbook again.
+After a failure the node stays cordoned and no further node is touched: fix the cause and run the playbook again; the annotated node is resumed, rebooted and uncordoned.
 
 Offline checks (no managed host is contacted):
 ```bash
