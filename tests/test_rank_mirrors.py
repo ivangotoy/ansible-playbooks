@@ -1,4 +1,5 @@
 from contextlib import redirect_stdout
+import gc
 import io
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+import warnings
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'playbooks' / 'files'))
 import rank_mirrors
@@ -78,6 +80,20 @@ class MainTests(unittest.TestCase):
                 self.run_main()
         self.assertEqual(self.mirrorlist.read_text(), original)
         self.assertEqual(sorted(p.name for p in self.directory.iterdir()), ['mirrorlist', 'pacman.conf'])
+
+
+class GroupsTests(unittest.TestCase):
+    def test_maps_each_mirrorlist_to_its_first_repository_and_closes_the_file(self):
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
+            config = Path(directory) / 'pacman.conf'
+            config.write_text('[options]\nInclude = /skip\n[core]\nInclude = /a\n[extra]\nInclude = /a\n'
+                              '[cachyos]\nInclude = /b\n')
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter('always')
+                result = rank_mirrors.groups(str(config))
+                gc.collect()
+        self.assertEqual(result, {'/a': 'core', '/b': 'cachyos'})
+        self.assertEqual([w for w in caught if issubclass(w.category, ResourceWarning)], [])
 
 
 if __name__ == '__main__':

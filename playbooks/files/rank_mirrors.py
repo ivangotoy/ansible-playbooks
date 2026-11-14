@@ -55,7 +55,9 @@ def pacman_conf(*args):
 def groups(config='/etc/pacman.conf'):
     """Map each included mirrorlist to the first repository that uses it."""
     result, repo = {}, None
-    for line in open(config, encoding='utf-8', errors='replace'):
+    with open(config, encoding='utf-8', errors='replace') as stream:
+        lines = stream.read().splitlines()
+    for line in lines:
         section = re.fullmatch(r'\[(.+)\]', line.strip())
         include = re.fullmatch(r'Include\s*=\s*(\S+)', line.strip())
         if section:
@@ -83,7 +85,8 @@ def replace(path, text):
 def main():
     changed = False
     for path, repo in groups().items():
-        lines = open(path, encoding='utf-8', errors='replace').read().splitlines()
+        with open(path, encoding='utf-8', errors='replace') as stream:
+            lines = stream.read().splitlines()
         servers = [line.split('=', 1)[1].strip() for line in pacman_conf('-r', repo)
                    if line.startswith('Server')]
         if len(servers) != sum(line.startswith('Server') for line in lines):
