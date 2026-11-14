@@ -4,11 +4,6 @@
   gather_facts: true
   become: false
   tasks:
-    - name: Register OS family as a host fact
-      ansible.builtin.set_fact:
-        os_family: "{{ ansible_facts['os_family'] }}"
-      args:
-        cacheable: true
     - name: Add Debian hosts to debian_hosts group
       ansible.builtin.group_by:
         key: "debian_hosts"
@@ -18,6 +13,8 @@
         key: "archlinux_hosts"
       when: ansible_facts['os_family'] == "Archlinux"
 
+# async is the hard limit of a job: when it expires the package manager is
+# killed mid-transaction, so it must exceed the slowest upgrade by far.
 - name: Update and upgrade packages on Debian-based systems
   hosts: debian_hosts
   become: true
@@ -26,13 +23,13 @@
     - name: Update package cache on Debian
       ansible.builtin.apt:
         update_cache: true
-      async: 300
+      async: 600
       poll: 10
 
     - name: Upgrade packages on Debian after successful cache refresh
       ansible.builtin.apt:
         upgrade: dist
-      async: 300
+      async: 3600
       poll: 10
 
 - name: Update and upgrade packages on Arch Linux-based systems
@@ -44,31 +41,5 @@
       community.general.pacman:
         update_cache: true
         upgrade: true
-      async: 300
-      poll: 0
-      register: arch_update_job
-
-    - name: Collect async job ID for Arch Linux task
-      ansible.builtin.set_fact:
-        arch_job_ids: "{{ [arch_update_job.ansible_job_id] }}"
-
-    - name: Wait for Arch Linux async jobs to complete
-      ansible.builtin.async_status:
-        jid: "{{ item }}"
-      register: job_result
-      until: job_result.finished
-      retries: 30
-      delay: 10
-      loop: "{{ arch_job_ids }}"
-      loop_control:
-        label: "{{ item }}"
-
-    - name: Debug async job results for Arch Linux
-      ansible.builtin.debug:
-        var: job_result
-
-    - name: Verify async job results on Arch Linux
-      ansible.builtin.debug:
-        msg: "Job {{ item.ansible_job_id }} completed successfully"
-      when: "item.finished == 1"
-      loop: "{{ job_result.results }}"
+      async: 3600
+      poll: 10

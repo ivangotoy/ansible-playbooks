@@ -3,38 +3,32 @@
   hosts: alder
   become: true
   vars:
-    jenkins_url: "http://alder:8090"
+    # The play runs on the Jenkins host itself.
+    jenkins_url: "http://127.0.0.1:8090"
     jenkins_username: "ivangotoy"
     jenkins_api_token: "{{ vault_jenkins_api_token }}"
-    jenkins_auth:
-      user: "{{ jenkins_username }}"
-      password: "{{ jenkins_api_token }}"
-      force_basic_auth: true
-    jenkins_opts:
-      validate_certs: false
   tasks:
     - name: Fetch Jenkins plugin list with updates
       ansible.builtin.uri:
         url: "{{ jenkins_url }}/pluginManager/api/json?depth=1"
-        method: GET
-        user: "{{ jenkins_auth.user }}"
-        password: "{{ jenkins_auth.password }}"
-        force_basic_auth: "{{ jenkins_auth.force_basic_auth }}"
-        return_content: true
-        validate_certs: "{{ jenkins_opts.validate_certs }}"
+        user: "{{ jenkins_username }}"
+        password: "{{ jenkins_api_token }}"
+        force_basic_auth: true
       register: plugins_response
 
-    - name: Set outdated plugins
-      ansible.builtin.set_fact:
-        outdated_plugins: "{{ plugins_response.json.plugins | selectattr('hasUpdate', 'equalto', true) | map(attribute='shortName') | list }}"
-
-    - name: Update outdated plugins in parallel
+    - name: Update outdated plugins
       community.general.jenkins_plugin:
         url: "{{ jenkins_url }}"
-        url_username: "{{ jenkins_auth.user }}"
-        url_password: "{{ jenkins_auth.password }}"
+        url_username: "{{ jenkins_username }}"
+        url_password: "{{ jenkins_api_token }}"
         name: "{{ item }}"
         state: latest
-        validate_certs: "{{ jenkins_opts.validate_certs }}"
-      loop: "{{ outdated_plugins }}"
-      when: outdated_plugins | length > 0
+      loop: "{{ plugins_response.json.plugins | selectattr('hasUpdate') | map(attribute='shortName') | list }}"
+      notify: Restart Jenkins
+
+  handlers:
+    # Updated plugins are loaded only by a restart.
+    - name: Restart Jenkins
+      ansible.builtin.systemd_service:
+        name: jenkins
+        state: restarted

@@ -51,12 +51,12 @@ kube    ansible_host=kube
 
 Two-phase playbook targeting Kubernetes node performance:
 
-**Phase 1 — Zero downtime (all nodes in parallel):**
-- Sets CPU governor to `performance` via cpupower, persisted across reboots
-- Disables Transparent Huge Pages (THP) at runtime and via systemd tmpfiles
+**Phase 1 - Zero downtime (all nodes in parallel):**
+- Sets `GOVERNOR='performance'` in `/etc/default/cpupower-service.conf` (the file the packaged `cpupower.service` reads), enables the service and restarts it when the file changed
+- Disables Transparent Huge Pages (THP) via systemd tmpfiles and applies the file when it changed
 - Applies network buffer sysctl tuning (`net.core.rmem_max`, `tcp_rmem`, `tcp_wmem`, etc.)
 
-**Phase 2 — Containerd tuning (serial restart):**
+**Phase 2 - Containerd tuning (serial restart):**
 - Requires Python 3.11+ (`python3` with `tomllib`) and the native `containerd` executable on each node.
 - Tunes explicit containerd config v2/v3 CRI tables, all `io.containerd.runc.v2` runtime option tables, and the v3 transfer-service download limit. Supports single/double quoted TOML table names.
 - Supports verified empty optional imports using simple `*`/`?` filename globs in literal directories, resolved relative to the config directory. Rechecks imports after native validation. Rejects matching imports, literal imports (even missing files), other glob syntax, malformed imports, duplicate keys, malformed TOML, missing required tables and unsupported runtimes/layouts. Review these configurations manually.
@@ -99,14 +99,15 @@ OS-aware package upgrade for mixed environments:
 - Auto-detects Debian vs Arch via `ansible_facts['os_family']`
 - Groups hosts dynamically at runtime
 - Debian cache refresh uses blocking async polling; only successful completion permits the dist-upgrade launch. Failures and timeouts stop that host.
-- Uses async execution with polling to avoid SSH timeouts on slow upgrades
+- Every package job runs async with polling so slow upgrades survive SSH timeouts; the upgrade jobs get 1 hour, because an expired async job kills the package manager mid-transaction
 
 ### update-jenkins-plugins.yml
 
 Automated Jenkins plugin updates via REST API:
 - Fetches plugin list and filters only plugins with available updates
-- Updates outdated plugins in parallel via `community.general.jenkins_plugin`
-- Requires `vault_jenkins_api_token` via Ansible Vault — never hardcode credentials
+- Updates outdated plugins via `community.general.jenkins_plugin`, then restarts Jenkins once so they load
+- Runs on the Jenkins host and talks to it on `127.0.0.1:8090`
+- Requires `vault_jenkins_api_token` via Ansible Vault - never hardcode credentials
 ```yaml
 # vars/vault.yml (ansible-vault encrypted)
 vault_jenkins_api_token: "your-token-here"

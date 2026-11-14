@@ -7,32 +7,6 @@
   gather_facts: false
   any_errors_fatal: true
   tasks:
-    - name: Remove package staging and records of the previous design
-      ansible.builtin.command:
-        argv:
-          - find
-          - /var/lib/ansible-maintenance
-          - -maxdepth
-          - "1"
-          - (
-          - -name
-          - packages-*
-          - -o
-          - -name
-          - pending.json
-          - -o
-          - -name
-          - completed.json
-          - )
-          - -print
-          - -exec
-          - rm
-          - -rf
-          - "{}"
-          - +
-      register: node_update_cleanup
-      changed_when: node_update_cleanup.stdout != ""
-
     - name: Sync the package databases
       community.general.pacman:
         update_cache: true
@@ -79,7 +53,7 @@
           register: node_update_readyz
           changed_when: false
           until: node_update_readyz.rc == 0
-          retries: 30
+          retries: "{{ node_update_wait_timeout // 5 }}"
           delay: 5
 
         - name: Wait for every node to be Ready
@@ -245,12 +219,6 @@
             src: /proc/sys/kernel/random/boot_id
           register: node_update_boot
 
-        - name: Wait for the API server port
-          ansible.builtin.wait_for:
-            port: 6443
-            timeout: "{{ node_update_wait_timeout }}"
-          delegate_to: "{{ node_update_control_plane }}"
-
         - name: Wait for the API server to be ready again
           ansible.builtin.command:
             argv: "{{ node_update_kubectl + ['get', '--raw=/readyz'] }}"
@@ -258,7 +226,7 @@
           register: node_update_readyz
           changed_when: false
           until: node_update_readyz.rc == 0
-          retries: 30
+          retries: "{{ node_update_wait_timeout // 5 }}"
           delay: 5
 
         - name: Wait for the node to report this boot, the installed kubelet and Ready

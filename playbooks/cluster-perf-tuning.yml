@@ -3,40 +3,27 @@
 # Applies: CPU governor, THP, network buffers, containerd optimizations
 # Containerd changes require Python 3.11+ and native config validation.
 
-- name: Phase 1 — sysctl + CPU governor + THP (all nodes, zero downtime)
+- name: Phase 1 - sysctl + CPU governor + THP (all nodes, zero downtime)
   hosts: kubernetes
   become: true
   gather_facts: false
 
   tasks:
-    - name: Set CPU governor to performance
-      ansible.builtin.command:
-        argv:
-          - cpupower
-          - frequency-set
-          - -g
-          - performance
-      changed_when: true
-
-    - name: Persist CPU governor via cpupower config
+    # The packaged cpupower.service reads GOVERNOR from this file only.
+    - name: Persist the performance CPU governor
       ansible.builtin.lineinfile:
-        path: /etc/default/cpupower
-        regexp: "^governor="
-        line: "governor='performance'"
+        path: /etc/default/cpupower-service.conf
+        regexp: "^#?GOVERNOR="
+        line: "GOVERNOR='performance'"
         create: true
         mode: "0644"
+      notify: Apply the CPU governor
 
     - name: Enable cpupower service
       ansible.builtin.systemd_service:
         name: cpupower
         enabled: true
         state: started
-
-    - name: Set THP to never (runtime)
-      ansible.builtin.shell: |
-        echo never > /sys/kernel/mm/transparent_hugepage/enabled
-        echo never > /sys/kernel/mm/transparent_hugepage/defrag
-      changed_when: true
 
     - name: Persist THP=never via systemd tmpfiles
       ansible.builtin.copy:
@@ -45,6 +32,7 @@
           w /sys/kernel/mm/transparent_hugepage/enabled - - - - never
           w /sys/kernel/mm/transparent_hugepage/defrag   - - - - never
         mode: "0644"
+      notify: Apply THP=never
 
     - name: Apply network buffer and perf sysctl
       ansible.posix.sysctl:
@@ -71,7 +59,18 @@
         - key: net.ipv4.tcp_slow_start_after_idle
           value: "0"
 
-- name: Phase 2 — containerd tuning (serial restart)
+  handlers:
+    - name: Apply the CPU governor
+      ansible.builtin.systemd_service:
+        name: cpupower
+        state: restarted
+
+    - name: Apply THP=never
+      ansible.builtin.command:
+        argv: [systemd-tmpfiles, --create, /etc/tmpfiles.d/thp-disable.conf]
+      changed_when: true
+
+- name: Phase 2 - containerd tuning (serial restart)
   hosts: kubernetes
   become: true
   gather_facts: false
@@ -81,7 +80,7 @@
     ansible_remote_tmp: /var/lib/ansible-maintenance/tmp
 
   tasks:
-    - name: Patch containerd config — SystemdCgroup + max_concurrent_downloads
+    - name: Patch containerd config - SystemdCgroup + max_concurrent_downloads
       ansible.builtin.script:
         cmd: files/tune_containerd.py /etc/containerd/config.toml
         executable: python3 -B
@@ -105,6 +104,8 @@
       ansible.builtin.command:
         argv:
           - crictl
+          - --runtime-endpoint
+          - unix:///run/containerd/containerd.sock
           - info
       retries: 10
       delay: 3
