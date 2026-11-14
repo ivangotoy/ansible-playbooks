@@ -54,7 +54,7 @@ Two-phase playbook targeting Kubernetes node performance:
 **Phase 1 - Zero downtime (all nodes in parallel):**
 - Sets `GOVERNOR='performance'` in `/etc/default/cpupower-service.conf` (the file the packaged `cpupower.service` reads), enables the service and restarts it when the file changed
 - Disables Transparent Huge Pages (THP) via systemd tmpfiles and applies the file when it changed
-- Applies network buffer sysctl tuning (`net.core.rmem_max`, `tcp_rmem`, `tcp_wmem`, etc.)
+- Applies network buffer sysctl tuning (`net.core.rmem_max`, `tcp_rmem`, `tcp_wmem`, etc.) in `/etc/sysctl.d/99-zz-k8s-perf.conf`, named to sort after other `99-*.conf` files so it wins at boot
 
 **Phase 2 - Containerd tuning (serial restart):**
 - Requires Python 3.11+ (`python3` with `tomllib`) and the native `containerd` executable on each node.

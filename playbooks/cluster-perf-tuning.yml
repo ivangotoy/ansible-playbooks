@@ -34,12 +34,14 @@
         mode: "0644"
       notify: Apply THP=never
 
+    # systemd-sysctl applies files in name order and the last value wins;
+    # 99-zz sorts after the 99-*.conf files of CachyOS and earlier setups.
     - name: Apply network buffer and perf sysctl
       ansible.posix.sysctl:
         name: "{{ item.key }}"
         value: "{{ item.value }}"
         state: present
-        sysctl_file: /etc/sysctl.d/99-k8s-perf.conf
+        sysctl_file: /etc/sysctl.d/99-zz-k8s-perf.conf
         reload: true
       loop:
         - key: net.core.rmem_max
