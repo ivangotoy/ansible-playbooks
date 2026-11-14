@@ -7,6 +7,7 @@ upgrade. cachyos-rate-mirrors forces fixed entries above its rated results.
 This downloads a repository database from the first HEAD servers of each
 mirrorlist named in /etc/pacman.conf and orders them by measured throughput.
 """
+import http.client
 import os
 import re
 import subprocess
@@ -30,7 +31,7 @@ def measure(url, seconds=SECONDS):
                 if not chunk:
                     break
                 received += len(chunk)
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
         return 0.0
     return received / max(time.monotonic() - start, 0.001)
 
