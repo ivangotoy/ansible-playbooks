@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -64,6 +65,21 @@ def groups(config='/etc/pacman.conf'):
     return result
 
 
+def replace(path, text):
+    """Replace a file atomically and durably; never leave the temporary file behind."""
+    fd, temporary = tempfile.mkstemp(prefix='.' + os.path.basename(path) + '.', dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as output:
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def main():
     changed = False
     for path, repo in groups().items():
@@ -78,11 +94,7 @@ def main():
             print('%s %7.2f MB/s %s' % (os.path.basename(path), speed / 1048576, url))
         ranked = rank(lines, speeds)
         if ranked != lines:
-            temporary = path + '.rank'
-            with open(temporary, 'w', encoding='utf-8') as output:
-                output.write('\n'.join(ranked) + '\n')
-            os.chmod(temporary, 0o644)
-            os.replace(temporary, path)
+            replace(path, '\n'.join(ranked) + '\n')
             changed = True
     print('REORDERED' if changed else 'UNCHANGED')
 

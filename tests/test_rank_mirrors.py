@@ -1,8 +1,13 @@
+from contextlib import redirect_stdout
+import io
+import os
 from pathlib import Path
 import socket
 import sys
+import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'playbooks' / 'files'))
 import rank_mirrors
@@ -35,6 +40,44 @@ class RankTests(unittest.TestCase):
 
     def test_invalid_server_url_measures_zero(self):
         self.assertEqual(rank_mirrors.measure('http://127.0.0.1:port/x.files', seconds=1), 0.0)
+
+
+class MainTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(dir=os.environ['TMPDIR'])
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+        self.mirrorlist = self.directory / 'mirrorlist'
+        self.mirrorlist.write_text('# rated\nServer = https://slow.example/$repo\nServer = https://fast.example/$repo\n')
+        self.config = self.directory / 'pacman.conf'
+        self.config.write_text('[options]\nArchitecture = auto\n[core]\nInclude = %s\n' % self.mirrorlist)
+        servers = ['Server = https://slow.example/core', 'Server = https://fast.example/core']
+        for name, value in (('pacman_conf', lambda *args: servers),
+                            ('measure', lambda url: 10.0 if 'fast' in url else 1.0),
+                            ('groups', lambda: {str(self.mirrorlist): 'core'})):
+            patcher = patch.object(rank_mirrors, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_main(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            rank_mirrors.main()
+        return output.getvalue()
+
+    def test_reorders_the_mirrorlist_in_place(self):
+        self.assertTrue(self.run_main().endswith('REORDERED\n'))
+        self.assertEqual(self.mirrorlist.read_text(),
+                         '# rated\nServer = https://fast.example/$repo\nServer = https://slow.example/$repo\n')
+        self.assertEqual(sorted(p.name for p in self.directory.iterdir()), ['mirrorlist', 'pacman.conf'])
+
+    def test_failed_replace_keeps_the_original_and_leaves_no_temporary_file(self):
+        original = self.mirrorlist.read_text()
+        with patch.object(rank_mirrors.os, 'replace', side_effect=OSError('read-only')):
+            with self.assertRaises(OSError):
+                self.run_main()
+        self.assertEqual(self.mirrorlist.read_text(), original)
+        self.assertEqual(sorted(p.name for p in self.directory.iterdir()), ['mirrorlist', 'pacman.conf'])
 
 
 if __name__ == '__main__':
