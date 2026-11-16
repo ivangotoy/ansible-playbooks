@@ -162,6 +162,15 @@ class PlaybookTests(unittest.TestCase):
         block = PLAYS[1]['tasks'][1]
         self.assertIn('node_update_resume', block['when'])
 
+    def test_every_kubectl_call_is_bounded_in_time(self):
+        self.assertIn('--request-timeout=10s', render('node_update_kubectl_request'))
+        calls = [task['ansible.builtin.command']['argv'] for play in PLAYS for task in tasks(play['tasks'])
+                 if 'node_update_kubectl' in str(task.get('ansible.builtin.command', {}).get('argv', ''))]
+        self.assertEqual(len(calls), 13)
+        for argv in calls:
+            with self.subTest(argv=argv):
+                self.assertTrue('node_update_kubectl_request +' in argv or "'--timeout=' ~" in argv)
+
     def test_cordon_mark_is_set_before_the_drain_and_removed_after_the_uncordon(self):
         names = [task['name'] for task in PLAYS[1]['tasks'][1]['block']]
         order = [names.index(name) for name in ('Mark the node as cordoned by this run', 'Drain the node',

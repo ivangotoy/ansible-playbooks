@@ -4,6 +4,12 @@
 node_update_control_plane: kube
 node_update_node_name: "{{ 'kube-controller' if inventory_hostname == node_update_control_plane else inventory_hostname }}"
 node_update_kubectl: [kubectl, --kubeconfig=/etc/kubernetes/admin.conf]
+# kubectl waits forever for an answer by default; drain and wait carry
+# their own --timeout, every other call uses this prefix.
+node_update_request_timeout: 10
+node_update_kubectl_request: >-
+  {{ node_update_kubectl
+     + ['--request-timeout=' ~ node_update_request_timeout ~ 's'] }}
 node_update_crictl: [crictl, --runtime-endpoint, unix:///run/containerd/containerd.sock]
 node_update_drain_timeout: 300
 node_update_wait_timeout: 300

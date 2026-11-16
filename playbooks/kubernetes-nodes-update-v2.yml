@@ -44,7 +44,7 @@
 
     - name: Read the node annotations
       ansible.builtin.command:
-        argv: "{{ node_update_kubectl + ['get', 'node', node_update_node_name, '-o', 'json'] }}"
+        argv: "{{ node_update_kubectl_request + ['get', 'node', node_update_node_name, '-o', 'json'] }}"
       delegate_to: "{{ node_update_control_plane }}"
       register: node_update_node_check
       changed_when: false
@@ -75,7 +75,7 @@
       block:
         - name: Wait for the API server to be ready
           ansible.builtin.command:
-            argv: "{{ node_update_kubectl + ['get', '--raw=/readyz'] }}"
+            argv: "{{ node_update_kubectl_request + ['get', '--raw=/readyz'] }}"
           delegate_to: "{{ node_update_control_plane }}"
           register: node_update_readyz
           changed_when: false
@@ -99,7 +99,7 @@
 
         - name: Read the node state before the drain
           ansible.builtin.command:
-            argv: "{{ node_update_kubectl + ['get', 'node', node_update_node_name, '-o', 'json'] }}"
+            argv: "{{ node_update_kubectl_request + ['get', 'node', node_update_node_name, '-o', 'json'] }}"
           delegate_to: "{{ node_update_control_plane }}"
           register: node_update_node_read
           changed_when: false
@@ -115,7 +115,8 @@
 
             - name: Read the API server version
               ansible.builtin.command:
-                argv: "{{ node_update_kubectl + ['version', '-o', 'json'] }}"
+                argv: "{{ node_update_kubectl_request
+                  + ['version', '-o', 'json'] }}"
               delegate_to: "{{ node_update_control_plane }}"
               register: node_update_api
               changed_when: false
@@ -130,7 +131,7 @@
 
         - name: Mark the node as cordoned by this run
           ansible.builtin.command:
-            argv: "{{ node_update_kubectl + ['annotate', '--overwrite', 'node', node_update_node_name,
+            argv: "{{ node_update_kubectl_request + ['annotate', '--overwrite', 'node', node_update_node_name,
               node_update_cordon_annotation ~ '=' ~ node_update_started] }}"
           delegate_to: "{{ node_update_control_plane }}"
           when: not node_update_was_cordoned
@@ -256,7 +257,7 @@
 
         - name: Wait for the API server to be ready again
           ansible.builtin.command:
-            argv: "{{ node_update_kubectl + ['get', '--raw=/readyz'] }}"
+            argv: "{{ node_update_kubectl_request + ['get', '--raw=/readyz'] }}"
           delegate_to: "{{ node_update_control_plane }}"
           register: node_update_readyz
           changed_when: false
@@ -277,14 +278,15 @@
 
         - name: Uncordon the node
           ansible.builtin.command:
-            argv: "{{ node_update_kubectl + ['uncordon', node_update_node_name] }}"
+            argv: "{{ node_update_kubectl_request
+              + ['uncordon', node_update_node_name] }}"
           delegate_to: "{{ node_update_control_plane }}"
           when: not node_update_was_cordoned
           changed_when: true
 
         - name: Remove the cordon mark of this run
           ansible.builtin.command:
-            argv: "{{ node_update_kubectl + ['annotate', 'node', node_update_node_name, node_update_cordon_annotation ~ '-'] }}"
+            argv: "{{ node_update_kubectl_request + ['annotate', 'node', node_update_node_name, node_update_cordon_annotation ~ '-'] }}"
           delegate_to: "{{ node_update_control_plane }}"
           when: not node_update_was_cordoned
           changed_when: true
@@ -309,7 +311,7 @@
   tasks:
     - name: Read the kubelet version the node reports
       ansible.builtin.command:
-        argv: "{{ node_update_kubectl + ['get', 'node', node_update_node_name,
+        argv: "{{ node_update_kubectl_request + ['get', 'node', node_update_node_name,
           '-o', 'jsonpath={.status.nodeInfo.kubeletVersion}'] }}"
       delegate_to: "{{ node_update_control_plane }}"
       register: node_update_reported
