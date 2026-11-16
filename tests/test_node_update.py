@@ -40,8 +40,24 @@ class RebootDecisionTests(unittest.TestCase):
         self.assertIs(self.decide(['bash'], kernel=False), True)
 
 
+def tasks(items):
+    for task in items:
+        yield task
+        yield from tasks(task.get('block', []))
+
+
+def pacman_print(*targets):
+    """Output of the repository version task for (name, version) targets, in its own --print-format."""
+    task = next(task for play in PLAYS for task in tasks(play.get('tasks', []))
+                if task.get('register') == 'node_update_kube_candidate')
+    argv = task['ansible.builtin.command']['argv']
+    form = argv[argv.index('--print-format') + 1]
+    return '\n'.join(form.replace('%n', name).replace('%v', version) for name, version in targets) + '\n'
+
+
 class KubernetesStepTests(unittest.TestCase):
-    def step(self, host, candidate, api, kubelet='v1.50.1'):
+    def step(self, host, candidate, api, kubelet='v1.50.1', dependencies=()):
+        candidate = pacman_print(*dependencies, ('kubeadm', candidate))
         facts = dict(node_update_kube_candidate={'stdout': candidate},
                      node_update_api={'stdout': json.dumps({'serverVersion': {'gitVersion': api}})},
                      node_update_node_read={'stdout': json.dumps({'status': {'nodeInfo': {'kubeletVersion': kubelet}}})})
@@ -64,6 +80,12 @@ class KubernetesStepTests(unittest.TestCase):
         self.assertEqual(self.step('node-09', '1.51.0-1', 'v1.51.0'), (True, False, True))
         self.assertEqual(self.step('node-09', '1.50.1-2', 'v1.50.1'), (True, False, False))
         self.assertIs(self.step('node-09', '1.51.0-1', 'v1.50.1')[0], False)
+
+
+    def test_dependency_printed_with_kubeadm_does_not_set_the_target(self):
+        dependency = [('conntrack-tools', '1.4.8-1')]
+        self.assertEqual(self.step('kube', '1.51.0-1', 'v1.50.1', dependencies=dependency), (True, True, False))
+        self.assertIs(self.step('node-09', '1.51.0-1', 'v1.50.1', dependencies=dependency)[0], False)
 
 
 class StateTests(unittest.TestCase):

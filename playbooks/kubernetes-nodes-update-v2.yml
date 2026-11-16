@@ -109,7 +109,7 @@
           block:
             - name: Read the Kubernetes version offered by the repository
               ansible.builtin.command:
-                argv: [pacman, -Sp, --print-format, "%v", kubeadm]
+                argv: [pacman, -Sp, --print-format, "%n %v", kubeadm]
               register: node_update_kube_candidate
               changed_when: false
 
