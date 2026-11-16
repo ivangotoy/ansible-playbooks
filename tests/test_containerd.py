@@ -158,6 +158,17 @@ class ContainerdTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), original)
             self.assertEqual(list(Path(directory).iterdir()), [path])
 
+    def test_failed_replace_keeps_the_original_and_leaves_no_backup(self):
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
+            path = Path(directory) / 'config.toml'
+            path.write_text(config())
+            original = path.read_bytes()
+            with patch.object(tuning.os, 'replace', side_effect=OSError('read-only')):
+                with self.assertRaisesRegex(OSError, 'read-only'):
+                    tuning.apply(path, lambda p: None)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
     def test_native_validation_command_is_read_only_and_bounded(self):
         with patch.object(tuning.subprocess, 'run') as run:
             tuning.native_validate(Path('/config.toml'))

@@ -128,6 +128,7 @@ def apply(path, validate):
         return False
     stat = path.stat()
     fd, candidate = tempfile.mkstemp(prefix='.containerd-', dir=path.parent)
+    backup = None
     try:
         with os.fdopen(fd, 'wb') as stream:
             stream.write(result)
@@ -144,10 +145,13 @@ def apply(path, validate):
         shutil.copy2(path, backup)
         os.chown(backup, stat.st_uid, stat.st_gid)
         os.replace(candidate, path)
+        backup = None
         return True
     finally:
-        if os.path.exists(candidate):
-            os.unlink(candidate)
+        # The backup is kept only next to a replaced configuration.
+        for leftover in (candidate, backup):
+            if leftover is not None and os.path.exists(leftover):
+                os.unlink(leftover)
 
 
 def native_validate(path):
