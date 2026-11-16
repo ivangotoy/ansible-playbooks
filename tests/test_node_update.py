@@ -178,6 +178,19 @@ class PlaybookTests(unittest.TestCase):
         self.assertEqual(order, sorted(order))
 
 
+class EtcdLookupTests(unittest.TestCase):
+    def test_etcd_lookup_matches_only_the_etcd_container(self):
+        # crictl ps --name is an unanchored regular expression matched against
+        # the container metadata name; another name containing etcd must not match.
+        import re
+        task = next(task for play in PLAYS for task in tasks(play.get('tasks', []))
+                    if task.get('register') == 'node_update_etcd')
+        found = re.search(r"'--name', '([^']*)'", task['ansible.builtin.command']['argv'])
+        self.assertIsNotNone(found)
+        names = ['etcd', 'etcd-defrag', 'backup-etcd', 'kube-apiserver']
+        self.assertEqual([n for n in names if re.search(found.group(1), n)], ['etcd'])
+
+
 class UpgradePlanTests(unittest.TestCase):
     """Tasks of the upgrade play that run per scenario; covers paths not yet run on a live node."""
 

@@ -164,7 +164,7 @@
 
                 - name: Find the etcd container
                   ansible.builtin.command:
-                    argv: "{{ node_update_crictl + ['ps', '--name', 'etcd', '--quiet'] }}"
+                    argv: "{{ node_update_crictl + ['ps', '--name', '^etcd$', '--quiet'] }}"
                   register: node_update_etcd
                   changed_when: false
 
