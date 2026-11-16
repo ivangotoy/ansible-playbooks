@@ -176,3 +176,85 @@ class PlaybookTests(unittest.TestCase):
         order = [names.index(name) for name in ('Mark the node as cordoned by this run', 'Drain the node',
                                                 'Uncordon the node', 'Remove the cordon mark of this run')]
         self.assertEqual(order, sorted(order))
+
+
+class UpgradePlanTests(unittest.TestCase):
+    """Tasks of the upgrade play that run per scenario; covers paths not yet run on a live node."""
+
+    def plan(self, host, packages=(), aur=(), resume=False, unschedulable=False, annotations=None,
+             candidate='1.51.0-1', api='v1.50.1', kubelet='v1.50.1'):
+        node = {'spec': {'unschedulable': unschedulable}, 'metadata': {'annotations': annotations or {}},
+                'status': {'nodeInfo': {'kubeletVersion': kubelet}}}
+        facts = dict(VARS, inventory_hostname=host, node_update_started='1700000000',
+                     node_update_download={'packages': list(packages)}, node_update_aur={'stdout_lines': list(aur)},
+                     node_update_resume=resume, node_update_marker_stat=stat(False),
+                     node_update_kernel_stat=stat(True), node_update_node_read={'stdout': json.dumps(node)},
+                     node_update_kube_candidate={'stdout': pacman_print(('kubeadm', candidate))},
+                     node_update_api={'stdout': json.dumps({'serverVersion': {'gitVersion': api}})},
+                     node_update_etcd={'stdout_lines': ['0123abcd']})
+        templar = Templar(loader=LOADER, variables=facts)
+        names = []
+
+        def walk(items):
+            for task in items:
+                when = task.get('when', [])
+                if not all(templar.evaluate_conditional(c) for c in ([when] if isinstance(when, str) else when)):
+                    continue
+                if 'block' in task:
+                    walk(task['block'])
+                    continue
+                names.append(task['name'])
+                if 'ansible.builtin.assert' in task:
+                    self.assertTrue(templar.evaluate_conditional(task['ansible.builtin.assert']['that']))
+                command = task.get('ansible.builtin.command', {})
+                if 'argv' in command and 'loop' not in task:
+                    self.assertTrue(all(isinstance(arg, str) for arg in templar.template(command['argv'])))
+
+        walk(PLAYS[1]['tasks'])
+        return names
+
+    def assertOrdered(self, names, expected):
+        self.assertEqual([name for name in names if name in expected], expected)
+
+    def test_control_plane_minor_step_backs_up_then_applies_before_the_install(self):
+        names = self.plan('kube', packages=['kubeadm', 'kubelet', 'bash'])
+        self.assertOrdered(names, ['Mark the node as cordoned by this run', 'Drain the node', 'Archive /etc/kubernetes',
+                                   'Save an etcd snapshot', 'Move the etcd snapshot into the backup directory',
+                                   'Install the new kubeadm', 'Upgrade the control plane',
+                                   'Install the downloaded upgrade',
+                                   'Restart the kubelet after the Kubernetes packages changed',
+                                   'Uncordon the node', 'Remove the cordon mark of this run'])
+        self.assertNotIn('Upgrade the kubelet configuration of the worker', names)
+        self.assertNotIn('Reboot the node', names)
+        self.assertNotIn('Build and install pending AUR upgrades', names)
+
+    def test_worker_step_runs_kubeadm_upgrade_node_without_control_plane_backup(self):
+        names = self.plan('node-09', packages=['kubeadm', 'kubelet'], api='v1.51.0')
+        self.assertOrdered(names, ['Drain the node', 'Install the new kubeadm',
+                                   'Upgrade the kubelet configuration of the worker',
+                                   'Install the downloaded upgrade', 'Uncordon the node'])
+        for name in ('Archive /etc/kubernetes', 'Save an etcd snapshot', 'Upgrade the control plane'):
+            self.assertNotIn(name, names)
+
+    def test_ordinary_upgrade_skips_kubeadm(self):
+        names = self.plan('node-09', packages=['bash'])
+        self.assertIn('Install the downloaded upgrade', names)
+        self.assertNotIn('Install the new kubeadm', names)
+        self.assertNotIn('Read the Kubernetes version offered by the repository', names)
+
+    def test_aur_only_node_is_neither_drained_nor_rebooted(self):
+        self.assertEqual(self.plan('node-09', aur=['x 1 -> 2']),
+                         ['Record the start time', 'Build and install pending AUR upgrades', 'Record the result'])
+
+    def test_resumed_node_is_drained_rebooted_and_uncordoned(self):
+        names = self.plan('node-09', resume=True, unschedulable=True,
+                          annotations={VARS['node_update_cordon_annotation']: '1690000000'})
+        self.assertOrdered(names, ['Mark the node as cordoned by this run', 'Drain the node', 'Reboot the node',
+                                   'Uncordon the node', 'Remove the cordon mark of this run'])
+        self.assertNotIn('Install the new kubeadm', names)
+
+    def test_operator_cordon_is_drained_and_kept(self):
+        names = self.plan('node-09', packages=['bash'], unschedulable=True)
+        self.assertIn('Drain the node', names)
+        for name in ('Mark the node as cordoned by this run', 'Uncordon the node', 'Remove the cordon mark of this run'):
+            self.assertNotIn(name, names)
