@@ -1,6 +1,5 @@
-> [!NOTE]
-> 🏡 **Home:** [git.digtvbg.com/ivangotoy/ansible-playbooks](https://git.digtvbg.com/ivangotoy/ansible-playbooks), where code, issues and releases live.
-> 🪞 **Mirror:** [github.com/ivangotoy/ansible-playbooks](https://github.com/ivangotoy/ansible-playbooks), read-only, synced automatically.
+> 🏠 **Home:** [git.digtvbg.com/ivangotoy/ansible-playbooks](https://git.digtvbg.com/ivangotoy/ansible-playbooks)\
+> 🔄 **Mirror:** [github.com/ivangotoy/ansible-playbooks](https://github.com/ivangotoy/ansible-playbooks) (read-only)
 
 # ansible-playbooks
 
