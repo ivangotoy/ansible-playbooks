@@ -1,5 +1,6 @@
-> ⚠️ **Mirror.** Primary repository: [git.digtvbg.com](https://git.digtvbg.com/ivangotoy/ansible-playbooks)
-> Development, issues, and PRs happen there. The GitHub repo is read-only.
+> [!NOTE]
+> 🏡 **Home:** [git.digtvbg.com/ivangotoy/ansible-playbooks](https://git.digtvbg.com/ivangotoy/ansible-playbooks), where code, issues and releases live.
+> 🪞 **Mirror:** [github.com/ivangotoy/ansible-playbooks](https://github.com/ivangotoy/ansible-playbooks), read-only, synced automatically.
 
 # ansible-playbooks
 
